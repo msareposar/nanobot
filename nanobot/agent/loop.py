@@ -727,19 +727,15 @@ class AgentLoop:
                 if media:
                     content, media = extract_documents(content, media)
                     media = media or None
-                user_content = self.context._build_user_content(content, media)
                 extra = goal_state_runtime_lines(session.metadata) if session is not None else []
-                runtime_ctx = self.context._build_runtime_context(
-                    pending_msg.channel,
-                    self._runtime_chat_id(pending_msg),
-                    self.context.timezone,
+                merged = self.context.build_user_content(
+                    content,
+                    media=media,
+                    channel=pending_msg.channel,
+                    chat_id=self._runtime_chat_id(pending_msg),
                     sender_id=pending_msg.sender_id,
                     supplemental_lines=extra or None,
                 )
-                if isinstance(user_content, str):
-                    merged: str | list[dict[str, Any]] = f"{user_content}\n\n{runtime_ctx}"
-                else:
-                    merged = user_content + [{"type": "text", "text": runtime_ctx}]
                 return {"role": "user", "content": merged}
 
             items: list[dict[str, Any]] = []

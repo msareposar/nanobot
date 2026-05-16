@@ -157,23 +157,14 @@ class ContextBuilder:
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         extra = goal_state_runtime_lines(session_metadata)
-        runtime_ctx = self._build_runtime_context(
-            channel,
-            chat_id,
-            self.timezone,
+        merged = self.build_user_content(
+            current_message,
+            media=media,
+            channel=channel,
+            chat_id=chat_id,
             sender_id=sender_id,
             supplemental_lines=extra or None,
         )
-        user_content = self._build_user_content(current_message, media)
-
-        # Merge runtime context and user content into a single user message
-        # to avoid consecutive same-role messages that some providers reject.
-        # Runtime context is appended to keep the user-content prefix stable
-        # for prompt-cache hits (the context changes every turn due to time).
-        if isinstance(user_content, str):
-            merged = f"{user_content}\n\n{runtime_ctx}"
-        else:
-            merged = user_content + [{"type": "text", "text": runtime_ctx}]
         messages = [
             {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, session_summary=session_summary)},
             *history,
@@ -185,6 +176,25 @@ class ContextBuilder:
             return messages
         messages.append({"role": current_role, "content": merged})
         return messages
+
+    def build_user_content(
+        self,
+        text: str,
+        media: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        sender_id: str | None = None,
+        supplemental_lines: Sequence[str] | None = None,
+    ) -> str | list[dict[str, Any]]:
+        """Build user content with media and runtime context merged into one payload."""
+        raw = self._build_user_content(text, media)
+        runtime_ctx = self._build_runtime_context(
+            channel, chat_id, self.timezone,
+            sender_id=sender_id, supplemental_lines=supplemental_lines,
+        )
+        if isinstance(raw, str):
+            return f"{raw}\n\n{runtime_ctx}"
+        return raw + [{"type": "text", "text": runtime_ctx}]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
