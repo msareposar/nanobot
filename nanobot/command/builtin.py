@@ -355,6 +355,8 @@ def _format_changed_files(diff: str) -> str:
 
 def _format_dream_log_content(commit, diff: str, *, requested_sha: str | None = None) -> str:
     files_line = _format_changed_files(diff)
+    # Show the first line of the commit message as a human-readable summary.
+    msg_summary = commit.message.splitlines()[0] if commit.message else ""
     lines = [
         "## Dream Update",
         "",
@@ -362,6 +364,7 @@ def _format_dream_log_content(commit, diff: str, *, requested_sha: str | None = 
         "",
         f"- Commit: `{commit.sha}`",
         f"- Time: {commit.timestamp}",
+        f"- Summary: {msg_summary}" if msg_summary else "",
         f"- Changed files: {files_line}",
     ]
     if diff:
