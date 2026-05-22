@@ -4,7 +4,7 @@ You have THREE tasks:
 3. Assign decay metadata so the system can manage memory lifecycle
 
 Output one line per finding:
-[FILE] atomic fact →TARGET #DECAY
+[ADD] atomic fact →TARGET #DECAY
 [REMOVE] →TARGET: exact line to remove (copy the line verbatim from the file)
 [SKILL] kebab-case-name: one-line description of the reusable pattern
 

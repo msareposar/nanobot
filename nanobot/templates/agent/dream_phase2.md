@@ -1,5 +1,5 @@
 Update memory files based on the analysis below.
-- [FILE] entries: add the described content to the appropriate file (use the →TARGET routing)
+- [ADD] entries: add the described content to the appropriate file (use the →TARGET routing)
 - [REMOVE] →TARGET entries: delete the line from the specified file
   - The target (→USER/→SOUL/→MEMORY) tells you which file to edit
   - To remove a line: use apply_patch Update File with the exact line prefixed by `-`
