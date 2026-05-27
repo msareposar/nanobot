@@ -11,6 +11,7 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y --no-install-recommends nodejs gh && \
     curl -fsSL https://github.com/openclaw/gogcli/releases/download/v0.19.0/gogcli_0.19.0_linux_amd64.tar.gz | tar -xz -C /usr/local/bin gog && \
+    curl -fsSL https://github.com/larksuite/cli/releases/download/v1.0.42/lark-cli-1.0.42-linux-amd64.tar.gz | tar -xz -C /usr/local/bin lark-cli && \
     apt-get purge -y gnupg && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
