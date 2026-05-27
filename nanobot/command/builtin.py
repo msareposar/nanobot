@@ -301,21 +301,27 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     """Manually trigger a Dream consolidation run."""
     import time
 
+    from nanobot.utils.prompt_templates import render_template
+
     loop = ctx.loop
     msg = ctx.msg
 
     async def _run_dream():
         t0 = time.monotonic()
         try:
-            did_work = await loop.dream.run()
+            prompt = render_template("agent/dream.md", strip=True)
+            await loop.process_direct(prompt, session_key="dream")
             elapsed = time.monotonic() - t0
-            if did_work:
-                content = f"Dream completed in {elapsed:.1f}s."
-            else:
-                content = "Dream: nothing to process."
+            content = f"Dream completed in {elapsed:.1f}s."
         except Exception as e:
             elapsed = time.monotonic() - t0
             content = f"Dream failed after {elapsed:.1f}s: {e}"
+        finally:
+            store = loop.context.memory
+            if store.git.is_initialized():
+                sha = store.git.auto_commit("dream: manual run")
+                if sha:
+                    content += f" (commit {sha})"
         await loop.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))

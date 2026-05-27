@@ -813,10 +813,19 @@ def _run_gateway(
         # Dream is an internal job — run directly, not through the agent loop.
         if job.name == "dream":
             try:
-                await agent.dream.run()
+                from nanobot.utils.prompt_templates import render_template
+
+                prompt = render_template("agent/dream.md", strip=True)
+                await agent.process_direct(prompt, session_key="dream")
                 logger.info("Dream cron job completed")
             except Exception:
                 logger.exception("Dream cron job failed")
+            finally:
+                store = agent.context.memory
+                if store.git.is_initialized():
+                    sha = store.git.auto_commit("dream: periodic memory consolidation")
+                    if sha:
+                        logger.info("Dream commit: {}", sha)
             return None
 
         from nanobot.utils.evaluator import evaluate_response
@@ -1026,20 +1035,15 @@ def _run_gateway(
         async with server:
             await server.serve_forever()
     # Register Dream system job (always-on, idempotent on restart)
-    dream_cfg = config.agents.defaults.dream
-    if dream_cfg.model_override:
-        agent.dream.model = dream_cfg.model_override
-    agent.dream.max_batch_size = dream_cfg.max_batch_size
-    agent.dream.max_iterations = dream_cfg.max_iterations
-    agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
-    from nanobot.cron.types import CronJob, CronPayload
+    from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+    dream_interval_h = config.agents.defaults.dream.interval_h
     cron.register_system_job(CronJob(
         id="dream",
         name="dream",
-        schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
+        schedule=CronSchedule(kind="every", every_ms=dream_interval_h * 3_600_000),
         payload=CronPayload(kind="system_event"),
     ))
-    console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+    console.print(f"[green]✓[/green] Dream: every {dream_interval_h}h")
 
     async def _open_browser_when_ready() -> None:
         """Wait for the gateway to bind, then point the user's browser at the webui."""
