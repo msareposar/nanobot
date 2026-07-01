@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -13,9 +12,14 @@ import httpx
 from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ToolCallRequest,
+    resolve_stream_idle_timeout_s,
+)
 from nanobot.providers.openai_responses import (
-    consume_sse,
+    consume_sse_with_reasoning,
     convert_messages,
     convert_tools,
 )
@@ -29,9 +33,14 @@ class OpenAICodexProvider(LLMProvider):
 
     supports_progress_deltas = True
 
-    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
+    def __init__(
+        self,
+        default_model: str = "openai-codex/gpt-5.1-codex",
+        proxy: str | None = None,
+    ):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
+        self.proxy = proxy or None
 
     async def _call_codex(
         self,
@@ -41,14 +50,12 @@ class OpenAICodexProvider(LLMProvider):
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
         system_prompt, input_items = convert_messages(messages)
-
-        token = await asyncio.to_thread(get_codex_token)
-        headers = _build_headers(token.account_id, token.access)
 
         body: dict[str, Any] = {
             "model": _strip_model_prefix(model),
@@ -62,28 +69,42 @@ class OpenAICodexProvider(LLMProvider):
             "tool_choice": tool_choice or "auto",
             "parallel_tool_calls": True,
         }
-        if reasoning_effort and reasoning_effort.lower() != "none":
-            body["reasoning"] = {"effort": reasoning_effort}
+        reasoning_options = _build_reasoning_options(reasoning_effort)
+        if reasoning_options:
+            body["reasoning"] = reasoning_options
         if tools:
             body["tools"] = convert_tools(tools)
 
         try:
+            token = await asyncio.to_thread(get_codex_token, proxy=self.proxy)
+            headers = _build_headers(token.account_id, token.access)
+
             try:
-                content, tool_calls, finish_reason = await _request_codex(
+                content, tool_calls, finish_reason, usage, reasoning_content = await _request_codex(
                     DEFAULT_CODEX_URL, headers, body, verify=True,
+                    proxy=self.proxy,
                     on_content_delta=on_content_delta,
+                    on_thinking_delta=on_thinking_delta,
                     on_tool_call_delta=on_tool_call_delta,
                 )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(
+                content, tool_calls, finish_reason, usage, reasoning_content = await _request_codex(
                     DEFAULT_CODEX_URL, headers, body, verify=False,
+                    proxy=self.proxy,
                     on_content_delta=on_content_delta,
+                    on_thinking_delta=on_thinking_delta,
                     on_tool_call_delta=on_tool_call_delta,
                 )
-            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
+            return LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                usage=usage,
+                reasoning_content=reasoning_content,
+            )
         except Exception as e:
             response = _codex_error_response(e)
             exc_type = "CodexHTTPError" if isinstance(e, _CodexHTTPError) else type(e).__name__
@@ -118,7 +139,6 @@ class OpenAICodexProvider(LLMProvider):
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        _ = on_thinking_delta
         return await self._call_codex(
             messages,
             tools,
@@ -126,6 +146,7 @@ class OpenAICodexProvider(LLMProvider):
             reasoning_effort,
             tool_choice,
             on_content_delta,
+            on_thinking_delta,
             on_tool_call_delta,
         )
 
@@ -137,6 +158,16 @@ def _strip_model_prefix(model: str) -> str:
     if model.startswith("openai-codex/") or model.startswith("openai_codex/"):
         return model.split("/", 1)[1]
     return model
+
+
+def _build_reasoning_options(reasoning_effort: str | None) -> dict[str, str] | None:
+    """Opt in to visible summaries without changing provider-default effort."""
+    if reasoning_effort and reasoning_effort.lower() == "none":
+        return {"effort": "none"}
+    options = {"summary": "auto"}
+    if reasoning_effort:
+        options["effort"] = reasoning_effort
+    return options
 
 
 def _build_headers(account_id: str, token: str) -> dict[str, str]:
@@ -175,11 +206,17 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    proxy: str | None = None,
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCallRequest], str]:
-    idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
-    async with httpx.AsyncClient(timeout=idle_timeout_s, verify=verify) as client:
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
+    idle_timeout_s = resolve_stream_idle_timeout_s()
+    client_kwargs: dict[str, Any] = {"timeout": idle_timeout_s, "verify": verify}
+    if proxy:
+        client_kwargs["proxy"] = proxy
+        client_kwargs["trust_env"] = False
+    async with httpx.AsyncClient(**client_kwargs) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
@@ -194,7 +231,12 @@ async def _request_codex(
                     error_code=error_code,
                     should_retry=_should_retry_status(response.status_code, error_type, error_code, raw),
                 )
-            return await consume_sse(response, on_content_delta, on_tool_call_delta)
+            return await consume_sse_with_reasoning(
+                response,
+                on_content_delta=on_content_delta,
+                on_tool_call_delta=on_tool_call_delta,
+                on_reasoning_delta=on_thinking_delta,
+            )
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:

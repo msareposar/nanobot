@@ -11,6 +11,7 @@ from loguru import logger
 import nanobot.providers.base as provider_base
 from nanobot.providers.openai_codex_provider import (
     OpenAICodexProvider,
+    _build_reasoning_options,
     _codex_error_response,
     _CodexHTTPError,
     _friendly_error,
@@ -20,9 +21,12 @@ from nanobot.providers.openai_codex_provider import (
 
 
 def _mock_codex_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_token(**_kwargs):
+        return SimpleNamespace(account_id="acct", access="token")
+
     monkeypatch.setattr(
         "nanobot.providers.openai_codex_provider.get_codex_token",
-        lambda: SimpleNamespace(account_id="acct", access="token"),
+        fake_token,
     )
 
 
@@ -76,7 +80,12 @@ async def test_codex_request_non_200_populates_http_metadata(monkeypatch) -> Non
             request=request,
         )
 
-    def fake_client(*, timeout: int, verify: bool) -> httpx.AsyncClient:
+    def fake_client(
+        *,
+        timeout: int,
+        verify: bool,
+        **_kwargs: object,
+    ) -> httpx.AsyncClient:
         assert timeout == 90
         assert verify is True
         return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
@@ -105,7 +114,12 @@ async def test_codex_request_honors_stream_idle_timeout_env(monkeypatch) -> None
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, request=request)
 
-    def fake_client(*, timeout: int, verify: bool) -> httpx.AsyncClient:
+    def fake_client(
+        *,
+        timeout: int,
+        verify: bool,
+        **_kwargs: object,
+    ) -> httpx.AsyncClient:
         seen["timeout"] = timeout
         return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
 
@@ -114,6 +128,39 @@ async def test_codex_request_honors_stream_idle_timeout_env(monkeypatch) -> None
     await _request_codex("https://codex.example/responses", {}, {"input": []}, verify=True)
 
     assert seen["timeout"] == 5
+
+
+@pytest.mark.asyncio
+async def test_codex_request_uses_configured_proxy(monkeypatch) -> None:
+    original_client = httpx.AsyncClient
+    seen: dict[str, object] = {}
+    proxy = "http://127.0.0.1:23458"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request)
+
+    def fake_client(
+        *,
+        timeout: int,
+        verify: bool,
+        proxy: str | None = None,
+        trust_env: bool = True,
+    ) -> httpx.AsyncClient:
+        seen["proxy"] = proxy
+        seen["trust_env"] = trust_env
+        return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.httpx.AsyncClient", fake_client)
+
+    await _request_codex(
+        "https://codex.example/responses",
+        {},
+        {"input": []},
+        verify=True,
+        proxy=proxy,
+    )
+
+    assert seen == {"proxy": proxy, "trust_env": False}
 
 
 @pytest.mark.asyncio
@@ -127,12 +174,14 @@ async def test_codex_prompt_cache_key_uses_stable_conversation_prefix(monkeypatc
         headers,
         body,
         verify,
+        proxy=None,
         on_content_delta=None,
+        on_thinking_delta=None,
         on_tool_call_delta=None,
     ):
-        _ = on_tool_call_delta
+        _ = proxy, on_thinking_delta, on_tool_call_delta
         bodies.append(body)
-        return "ok", [], "stop"
+        return "ok", [], "stop", {}, None
 
     monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
 
@@ -182,6 +231,40 @@ async def test_codex_timeout_error_is_typed_and_retryable(monkeypatch) -> None:
     )
     assert response.error_kind == "timeout"
     assert response.error_should_retry is True
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_passes_proxy_to_oauth_and_response_request(monkeypatch) -> None:
+    proxy = "http://127.0.0.1:23458"
+    seen: dict[str, object] = {}
+
+    def fake_token(*, proxy=None):
+        seen["token_proxy"] = proxy
+        return SimpleNamespace(account_id="acct", access="token")
+
+    async def fake_request(
+        url,
+        headers,
+        body,
+        verify,
+        proxy=None,
+        on_content_delta=None,
+        on_thinking_delta=None,
+        on_tool_call_delta=None,
+    ):
+        _ = url, headers, body, verify, on_content_delta, on_thinking_delta, on_tool_call_delta
+        seen["request_proxy"] = proxy
+        return "ok", [], "stop", {}, None
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_token)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+
+    provider = OpenAICodexProvider(proxy=proxy)
+    response = await provider.chat([{"role": "user", "content": "hello"}])
+
+    assert response.content == "ok"
+    assert seen["token_proxy"] == proxy
+    assert seen["request_proxy"] == proxy
 
 
 @pytest.mark.asyncio
@@ -257,7 +340,7 @@ async def test_codex_retry_uses_structured_timeout_metadata(monkeypatch) -> None
         calls += 1
         if calls == 1:
             raise httpx.ReadTimeout("")
-        return "ok", [], "stop"
+        return "ok", [], "stop", {}, None
 
     async def fake_sleep(delay: float) -> None:
         delays.append(delay)
@@ -397,3 +480,61 @@ def test_codex_429_classification_uses_raw_error_semantics(
     error_type, error_code = provider_base.LLMProvider._extract_error_type_code(raw)
 
     assert _should_retry_status(429, error_type, error_code, raw) is expected_retry
+
+
+def test_codex_reasoning_options_request_summary_without_forcing_effort() -> None:
+    assert _build_reasoning_options(None) == {"summary": "auto"}
+    assert _build_reasoning_options("high") == {"summary": "auto", "effort": "high"}
+    assert _build_reasoning_options("none") == {"effort": "none"}
+
+
+@pytest.mark.asyncio
+async def test_codex_stream_surfaces_reasoning_summary(monkeypatch) -> None:
+    def fake_token(**_kwargs):
+        return SimpleNamespace(account_id="acct", access="token")
+
+    monkeypatch.setattr(
+        "nanobot.providers.openai_codex_provider.get_codex_token",
+        fake_token,
+    )
+
+    async def fake_request(
+        url,
+        headers,
+        body,
+        verify,
+        proxy=None,
+        on_content_delta=None,
+        on_thinking_delta=None,
+        on_tool_call_delta=None,
+    ):
+        _ = url, headers, verify, proxy, on_tool_call_delta
+        assert body["reasoning"] == {"summary": "auto", "effort": "medium"}
+        if on_content_delta:
+            await on_content_delta("answer")
+        if on_thinking_delta:
+            await on_thinking_delta("summary")
+        return "answer", [], "stop", {"prompt_tokens": 10, "completion_tokens": 5}, "summary"
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+
+    provider = OpenAICodexProvider()
+    content_deltas: list[str] = []
+    thinking_deltas: list[str] = []
+
+    response = await provider.chat_stream(
+        [{"role": "user", "content": "hi"}],
+        reasoning_effort="medium",
+        on_content_delta=lambda delta: _append(content_deltas, delta),
+        on_thinking_delta=lambda delta: _append(thinking_deltas, delta),
+    )
+
+    assert content_deltas == ["answer"]
+    assert thinking_deltas == ["summary"]
+    assert response.content == "answer"
+    assert response.usage == {"prompt_tokens": 10, "completion_tokens": 5}
+    assert response.reasoning_content == "summary"
+
+
+async def _append(target: list[str], value: str) -> None:
+    target.append(value)
