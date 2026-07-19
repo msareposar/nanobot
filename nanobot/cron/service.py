@@ -1,6 +1,7 @@
 """Cron service for scheduling agent tasks."""
 
 import asyncio
+import errno
 import json
 import os
 import time
@@ -22,6 +23,12 @@ from nanobot.cron.types import (
     CronRunRecord,
     CronSchedule,
     CronStore,
+)
+from nanobot.utils.run_records import (
+    safe_run_record_name,
+)
+from nanobot.utils.run_records import (
+    write_run_record as write_automation_run_record,
 )
 
 
@@ -215,62 +222,7 @@ class CronService:
                 jobs = []
                 version = data.get("version", 1)
                 for j in data.get("jobs", []):
-                    job = CronJob(
-                        id=j["id"],
-                        name=j["name"],
-                        enabled=j.get("enabled", True),
-                        schedule=CronSchedule(
-                            kind=j["schedule"]["kind"],
-                            at_ms=j["schedule"].get("atMs"),
-                            every_ms=j["schedule"].get("everyMs"),
-                            expr=j["schedule"].get("expr"),
-                            tz=j["schedule"].get("tz"),
-                        ),
-                        payload=CronPayload(
-                            kind=j["payload"].get("kind", "agent_turn"),
-                            message=j["payload"].get("message", ""),
-                            deliver=j["payload"].get("deliver", False),
-                            channel=j["payload"].get("channel"),
-                            to=j["payload"].get("to"),
-                            channel_meta=(
-                                j["payload"].get("channelMeta")
-                                or j["payload"].get("channel_meta")
-                                or {}
-                            ),
-                            session_key=j["payload"].get("sessionKey") or j["payload"].get("session_key"),
-                            origin_channel=(
-                                j["payload"].get("originChannel")
-                                or j["payload"].get("origin_channel")
-                            ),
-                            origin_chat_id=(
-                                j["payload"].get("originChatId")
-                                or j["payload"].get("origin_chat_id")
-                            ),
-                            origin_metadata=(
-                                j["payload"].get("originMetadata")
-                                or j["payload"].get("origin_metadata")
-                                or {}
-                            ),
-                        ),
-                        state=CronJobState(
-                            next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
-                            last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
-                            last_status=j.get("state", {}).get("lastStatus"),
-                            last_error=j.get("state", {}).get("lastError"),
-                            run_history=[
-                                CronRunRecord(
-                                    run_at_ms=r["runAtMs"],
-                                    status=r["status"],
-                                    duration_ms=r.get("durationMs", 0),
-                                    error=r.get("error"),
-                                )
-                                for r in j.get("state", {}).get("runHistory", [])
-                            ],
-                        ),
-                        created_at_ms=j.get("createdAtMs", 0),
-                        updated_at_ms=j.get("updatedAtMs", 0),
-                        delete_after_run=j.get("deleteAfterRun", False),
-                    )
+                    job = CronJob.from_store_dict(j)
                     _normalize_agent_turn_job(job)
                     jobs.append(job)
             except Exception:
@@ -456,11 +408,15 @@ class CronService:
             os.replace(tmp_path, path)
             # fsync the parent directory so the rename itself is durable.
             # Skip on Windows where opening a directory raises PermissionError;
-            # NTFS journals metadata synchronously so this is a no-op there.
+            # some shared filesystems reject directory fsync with EINVAL.
             with suppress(PermissionError):
                 fd = os.open(str(path.parent), os.O_RDONLY)
                 try:
-                    os.fsync(fd)
+                    try:
+                        os.fsync(fd)
+                    except OSError as exc:
+                        if exc.errno != errno.EINVAL:
+                            raise
                 finally:
                     os.close(fd)
         except BaseException:
@@ -469,20 +425,11 @@ class CronService:
 
     @staticmethod
     def _safe_run_record_name(run_id: str) -> str:
-        return "".join(c if c.isalnum() or c in "._-" else "_" for c in run_id)
+        return safe_run_record_name(run_id)
 
     def write_run_record(self, run_id: str, record: dict[str, Any]) -> None:
         """Write an internal audit record for one cron execution."""
-        name = self._safe_run_record_name(run_id)
-        if not name:
-            name = str(uuid.uuid4())
-        path = self._run_records_dir / f"{name}.json"
-        payload = {
-            **record,
-            "run_id": run_id,
-            "updated_at_ms": _now_ms(),
-        }
-        self._atomic_write(path, json.dumps(payload, indent=2, ensure_ascii=False))
+        write_automation_run_record(self._run_records_dir, run_id, record)
 
     async def start(self) -> None:
         """Start the cron service."""

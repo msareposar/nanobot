@@ -128,7 +128,15 @@ class _ExecSession:
     ) -> _SessionPoll:
         self.last_access = time.monotonic()
         if yield_time_ms > 0 and self.process.returncode is None:
-            await asyncio.sleep(min(yield_time_ms, MAX_YIELD_MS) / 1000)
+            wait_s = min(yield_time_ms, MAX_YIELD_MS) / 1000
+            remaining_s = self.deadline - time.monotonic()
+            if remaining_s <= 0:
+                wait_s = 0
+            else:
+                wait_s = min(wait_s, remaining_s)
+            if wait_s > 0:
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.process.wait(), timeout=wait_s)
 
         if self.process.returncode is None and time.monotonic() >= self.deadline:
             self._timed_out = True
@@ -140,6 +148,9 @@ class _ExecSession:
                     asyncio.gather(self._stdout_task, self._stderr_task),
                     timeout=2.0,
                 )
+            # Safety-net reap after normal exit.
+            from nanobot.agent.tools.shell import _reap_pid
+            _reap_pid(self.process.pid)
         elif yield_time_ms > 0:
             await self._wait_for_buffered_output()
 
@@ -163,8 +174,14 @@ class _ExecSession:
         if self.process.returncode is not None:
             return
         self.process.kill()
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        try:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        finally:
+            # Safety-net waitpid — prevent zombie if asyncio's child watcher
+            # did not reap the process (common in containers).
+            from nanobot.agent.tools.shell import _reap_pid
+            _reap_pid(self.process.pid)
 
     async def _wait_for_buffered_output(self) -> None:
         deadline = time.monotonic() + OUTPUT_DRAIN_GRACE_S
@@ -233,11 +250,7 @@ class ExecSessionManager:
             session = self._sessions.get(session_id)
         if session is None:
             raise KeyError(session_id)
-        if (
-            owner_session_key
-            and session.owner_session_key
-            and session.owner_session_key != owner_session_key
-        ):
+        if session.owner_session_key and session.owner_session_key != owner_session_key:
             raise KeyError(session_id)
 
         if chars:
@@ -279,9 +292,7 @@ class ExecSessionManager:
                     owner_session_key=session.owner_session_key,
                 )
                 for session_id, session in sorted(self._sessions.items())
-                if not owner_session_key
-                or not session.owner_session_key
-                or session.owner_session_key == owner_session_key
+                if session.owner_session_key == owner_session_key
             ]
 
     async def _cleanup_locked(self) -> None:
@@ -425,7 +436,7 @@ class WriteStdinTool(Tool):
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        return cls()
+        return cls(manager=getattr(ctx, "exec_session_manager", None))
 
     @property
     def exclusive(self) -> bool:
@@ -569,7 +580,7 @@ class ListExecSessionsTool(Tool):
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        return cls()
+        return cls(manager=getattr(ctx, "exec_session_manager", None))
 
     @property
     def name(self) -> str:
