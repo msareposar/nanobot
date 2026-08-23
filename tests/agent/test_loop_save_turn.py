@@ -36,6 +36,7 @@ from nanobot.session.keys import (
     UNIFIED_SESSION_KEY,
 )
 from nanobot.session.manager import Session
+from nanobot.session.recovery import PENDING_FOLLOWUP_ID_KEY, PENDING_FOLLOWUPS_KEY
 from nanobot.session.turn_continuation import (
     INTERNAL_CONTINUATION_META,
     INTERNAL_CONTINUATION_RUN_STARTED_AT_META,
@@ -159,6 +160,35 @@ def test_persist_cron_turn_uses_distinct_history_marker(tmp_path: Path) -> None:
     assert message["cron_job_name"] == "Daily check"
     assert message["cron_run_id"] == "job-1:1"
     assert message["cron_prompt_ref"] == prompt_ref
+
+
+def test_persist_user_message_acknowledges_durable_followup(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    session = loop.sessions.get_or_create("websocket:chat")
+    session.metadata[PENDING_FOLLOWUPS_KEY] = [
+        {
+            "id": "followup-1",
+            "sender_id": "user",
+            "chat_id": "chat",
+            "content": "queued while busy",
+            "media": [],
+            "metadata": {},
+        }
+    ]
+
+    persisted = loop._persist_user_message_early(
+        InboundMessage(
+            channel="websocket",
+            sender_id="user",
+            chat_id="chat",
+            content="queued while busy",
+            metadata={PENDING_FOLLOWUP_ID_KEY: "followup-1"},
+        ),
+        session,
+    )
+
+    assert persisted is True
+    assert PENDING_FOLLOWUPS_KEY not in session.metadata
 
 
 def test_persist_local_trigger_turn_uses_hidden_automation_marker(tmp_path: Path) -> None:
@@ -379,6 +409,34 @@ def test_save_turn_keeps_multimodal_runtime_context_for_model_replay() -> None:
         {"type": "text", "text": "provider context"}
     ]
     assert public_history_message(session.messages[0])["content"] == []
+
+
+def test_save_turn_acknowledges_every_merged_recovery_followup() -> None:
+    """Persisting a merged injected row retires every durable follow-up ID."""
+    loop = _mk_loop()
+    session = Session(
+        key="test:recovery-followups",
+        metadata={
+            PENDING_FOLLOWUPS_KEY: [
+                {"id": "first"},
+                {"id": "second"},
+            ]
+        },
+    )
+
+    loop._save_turn(
+        session,
+        [
+            {
+                "role": "user",
+                "content": "first\n\nsecond",
+                PENDING_FOLLOWUP_ID_KEY: ["first", "second"],
+            }
+        ],
+        skip=0,
+    )
+
+    assert PENDING_FOLLOWUPS_KEY not in session.metadata
 
 
 def test_save_turn_keeps_image_placeholder_and_runtime_context() -> None:
@@ -1817,6 +1875,33 @@ async def test_system_subagent_followup_is_persisted_before_prompt_assembly(tmp_
         },
         {"role": "assistant", "content": "done"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_turn_usage_is_persisted_with_the_saved_session(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    async def fake_run_agent_loop(initial_messages, **_kwargs):
+        loop._last_usage = {"prompt_tokens": 64, "completion_tokens": 9}
+        return (
+            "done",
+            [],
+            [*initial_messages, {"role": "assistant", "content": "done"}],
+            "stop",
+            False,
+        )
+
+    loop._run_agent_loop = fake_run_agent_loop  # type: ignore[method-assign]
+    await loop._process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="usage", content="hello")
+    )
+
+    loop.sessions.invalidate("cli:usage")
+    assert loop.sessions.get_or_create("cli:usage").metadata["_last_usage"] == {
+        "prompt_tokens": 64,
+        "completion_tokens": 9,
+    }
 
 
 @pytest.mark.asyncio

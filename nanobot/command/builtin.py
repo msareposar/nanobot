@@ -8,11 +8,11 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from nanobot import __version__
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import INBOUND_META_USER_SHELL, OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter, normalize_command_text
 from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
@@ -36,6 +36,8 @@ CommandLifecycle = Literal[
     "agent_turn",
     "agent_turn_with_args",
 ]
+
+USER_SHELL_COMMAND = "/__shell"
 
 
 @dataclass(frozen=True)
@@ -304,19 +306,26 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     await loop._cancel_active_tasks(ctx.key)  # pyright: ignore[reportPrivateUsage]
     loop.discard_session_file_state(ctx.key)
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
-    snapshot = session.messages[session.last_consolidated:]
+    snapshot = list(session.messages)
+    archive_snapshot = None
     runtime = None
-    if snapshot:
+    if session.last_consolidated < len(snapshot):
         runtime = ctx.runtime or loop.runtime_for_session(session)
+        archive_snapshot = replace(
+            session,
+            messages=snapshot,
+            metadata=dict(session.metadata),
+            provider_state=None,
+        )
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
-    if snapshot and runtime is not None:
+    if archive_snapshot is not None and runtime is not None:
         loop.schedule_background(
-            loop.consolidator.archive(  # pyright: ignore[reportUnknownMemberType]
-                snapshot,
+            loop.consolidator.archive_session(  # pyright: ignore[reportUnknownMemberType]
+                archive_snapshot,
+                archive_end=len(snapshot),
                 runtime=runtime,
-                session_key=ctx.key,
             )
         )
     return OutboundMessage(
@@ -414,14 +423,16 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     msg = ctx.msg
 
     async def _run_dream():
-        from nanobot.agent.memory import DreamRunProgress, MemoryStore
+        from nanobot.agent.memory import MemoryStore
+
+        async def _silent(*_args: Any, **_kwargs: Any) -> None:
+            pass
 
         dream_session_key = MemoryStore.dream_session_key
         build_dream_commit_message = MemoryStore.build_dream_commit_message
         prune_dream_sessions = MemoryStore.prune_dream_sessions
 
         store = loop.context.memory
-        progress = DreamRunProgress()
         content = ""
         resp = None
         diff_body = ""
@@ -443,17 +454,14 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 session_key=key,
                 ephemeral=True,
                 tools=store.build_dream_tools(),
-                on_progress=progress,
+                on_progress=_silent,
                 runtime=dream_runtime,
             )
             elapsed = time.monotonic() - t0
-            # The real file delta grounds the audit record; clean completion
+            # The real file delta grounds the audit record; normal completion
             # decides whether this history batch has finished processing.
             diff_body = store.dream_content_diff()
-            completed = MemoryStore.dream_run_completed(
-                resp,
-                had_tool_errors=progress.had_tool_errors,
-            )
+            completed = MemoryStore.dream_run_completed(resp)
             if completed:
                 store.set_last_dream_cursor(last_cursor)
                 if diff_body:
@@ -461,8 +469,9 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 else:
                     content = f"Dream completed in {elapsed:.1f}s; no memory changes."
             else:
+                reason = MemoryStore.dream_incompletion_reason(resp)
                 content = (
-                    f"Dream did not complete after {elapsed:.1f}s; "
+                    f"Dream did not complete after {elapsed:.1f}s ({reason}); "
                     "memory cursor was not advanced."
                 )
         except Exception as e:
@@ -999,6 +1008,30 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_user_shell(ctx: CommandContext) -> OutboundMessage:
+    """Run a trusted local ``!command`` through nanobot's exec policy."""
+    metadata = dict(ctx.msg.metadata or {})
+    if (
+        ctx.msg.channel != "websocket"
+        or metadata.get("webui") is not True
+        or metadata.get(INBOUND_META_USER_SHELL) is not True
+    ):
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Shell commands are only available from a trusted local client.",
+            metadata={**metadata, "render_as": "text"},
+        )
+    if not ctx.args.strip():
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Type a command after `!`, for example `!pwd`.",
+            metadata={**metadata, "render_as": "text"},
+        )
+    return await ctx.loop.execute_user_shell_command(ctx)
+
+
 def build_help_text() -> str:
     """Build canonical help text shared across channels."""
     lines = ["🐈 nanobot commands:"]
@@ -1038,3 +1071,5 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)
+    router.exact(USER_SHELL_COMMAND, cmd_user_shell)
+    router.prefix(f"{USER_SHELL_COMMAND} ", cmd_user_shell)

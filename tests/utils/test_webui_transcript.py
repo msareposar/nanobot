@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import nanobot.webui.transcript as transcript_module
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
 from nanobot.webui.transcript import (
@@ -393,6 +395,55 @@ def test_replay_delta_and_turn_end(tmp_path, monkeypatch) -> None:
     assert msgs[1]["latencyMs"] == 42
 
 
+def test_replay_canonical_completed_stream_records() -> None:
+    msgs = replay_transcript_to_ui_messages([
+        {"event": "user", "chat_id": "canonical", "text": "q"},
+        {"event": "reasoning_end", "chat_id": "canonical", "text": "think"},
+        {"event": "stream_end", "chat_id": "canonical", "text": "answer"},
+        {"event": "turn_end", "chat_id": "canonical", "latency_ms": 42},
+    ])
+
+    assert len(msgs) == 2
+    assert msgs[1]["content"] == "answer"
+    assert msgs[1]["reasoning"] == "think"
+    assert msgs[1]["latencyMs"] == 42
+
+
+def test_replay_turn_end_preserves_usage_semantics(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:t-usage"
+    for event in (
+        {"event": "user", "chat_id": "t-usage", "text": "q"},
+        {"event": "message", "chat_id": "t-usage", "text": "a"},
+        {
+            "event": "turn_end",
+            "chat_id": "t-usage",
+            "latency_ms": 18_200,
+            "usage": {
+                "prompt_tokens": 12_400,
+                "completion_tokens": 823,
+                "cached_tokens": 9_672,
+                "context_tokens": 8_200,
+                "request_count": 3,
+            },
+            "context_window_tokens": 128_000,
+        },
+    ):
+        append_transcript_object(key, event)
+
+    messages = replay_transcript_to_ui_messages(read_transcript_lines(key))
+
+    assert messages[-1]["usage"] == {
+        "prompt_tokens": 12_400,
+        "completion_tokens": 823,
+        "cached_tokens": 9_672,
+        "context_tokens": 8_200,
+        "request_count": 3,
+    }
+    assert messages[-1]["contextWindowTokens"] == 128_000
+    assert messages[-1]["latencyMs"] == 18_200
+
+
 def test_replay_uses_persisted_created_at_ms() -> None:
     msgs = replay_transcript_to_ui_messages(
         [
@@ -503,6 +554,22 @@ def test_thread_response_marks_unfinished_tool_tail_pending(tmp_path, monkeypatc
     assert out is not None
     assert out["has_pending_tool_calls"] is True
     assert out["completed_turn_ids"] == []
+
+
+def test_recovery_tail_check_reads_only_the_active_transcript(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    key = "websocket:recovery-tail"
+    active_path = transcript_module.webui_transcript_path(key)
+    reads: list[Path] = []
+
+    def read(path: Path) -> list[dict[str, object]]:
+        reads.append(path)
+        return [{"event": "message", "kind": "progress", "text": "running"}]
+
+    monkeypatch.setattr(transcript_module, "_read_transcript_file", read)
+
+    assert transcript_module.has_unfinished_transcript_tail(key) is True
+    assert reads == [active_path]
 
 
 def test_thread_response_reports_active_registry_without_transcript(
@@ -1436,7 +1503,7 @@ def test_replay_keeps_every_file_from_one_apply_patch_call() -> None:
     assert [edit["path"] for edit in msgs[0]["fileEdits"]] == ["USER.md", "MEMORY.md"]
 
 
-def test_replay_keeps_interrupted_pre_tool_text_in_activity() -> None:
+def test_replay_keeps_interrupted_pre_tool_text_as_answer() -> None:
     msgs = replay_transcript_to_ui_messages([
         {"event": "delta", "chat_id": "t-stream", "text": "I will inspect first."},
         {"event": "stream_end", "chat_id": "t-stream"},
@@ -1455,8 +1522,10 @@ def test_replay_keeps_interrupted_pre_tool_text_in_activity() -> None:
 
     assert len(msgs) == 3
     assert msgs[0]["role"] == "assistant"
-    assert msgs[0]["content"] == ""
-    assert msgs[0]["reasoning"] == "I will inspect first."
+    assert msgs[0]["content"] == "I will inspect first."
+    assert msgs[0]["turnPhase"] == "answer"
+    assert "reasoning" not in msgs[0]
+    assert "activitySegmentId" not in msgs[0]
     assert "isStreaming" not in msgs[0]
     assert msgs[1]["kind"] == "trace"
     assert msgs[1]["traces"] == ['exec({"cmd":"ls"})']
