@@ -82,6 +82,120 @@ def _json_object(value: object) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def _archive_offset(data: dict[str, Any]) -> int:
+    """Read the Memory archive watermark across the field-name migration."""
+    for key in ("last_archived", "last_consolidated"):
+        offset = cast(object, data.get(key))
+        if isinstance(offset, int) and not isinstance(offset, bool):
+            return offset
+    return 0
+
+
+# TODO(0.3.2): Remove the write_stdin replay migration after 0.3.1.
+def _migrate_legacy_exec_arguments(container: dict[str, Any]) -> bool:
+    raw_arguments = cast(object, container.get("arguments"))
+    encoded = isinstance(raw_arguments, str)
+    if encoded:
+        try:
+            decoded: object = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return False
+    else:
+        decoded = raw_arguments
+    if not isinstance(decoded, dict):
+        return False
+
+    arguments = cast(dict[str, Any], decoded)
+    changed = False
+    if "chars" in arguments:
+        if "input" not in arguments:
+            arguments["input"] = arguments["chars"]
+        arguments.pop("chars")
+        changed = True
+
+    wait_key = (
+        "wait_timeout_ms"
+        if arguments.get("wait_for") or arguments.get("until_exit")
+        else "yield_time_ms"
+    )
+    if "timeout_ms" not in arguments and wait_key in arguments:
+        arguments["timeout_ms"] = arguments[wait_key]
+    for key in ("yield_time_ms", "wait_timeout_ms", "max_output_chars", "max_output_tokens"):
+        if key in arguments:
+            arguments.pop(key)
+            changed = True
+
+    if changed:
+        container["arguments"] = (
+            json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            if encoded
+            else arguments
+        )
+    return changed
+
+
+def _migrate_legacy_exec_tool_call(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    tool_call = cast(dict[str, Any], value)
+    function_value = cast(object, tool_call.get("function"))
+    function = (
+        cast(dict[str, Any], function_value)
+        if isinstance(function_value, dict)
+        else tool_call
+    )
+    name = function.get("name")
+    if name not in {"write_stdin", "exec_session"}:
+        return False
+
+    changed = name == "write_stdin"
+    if changed:
+        function["name"] = "exec_session"
+    return _migrate_legacy_exec_arguments(function) or changed
+
+
+def _migrate_legacy_exec_message(message: dict[str, Any]) -> bool:
+    changed = False
+    if message.get("name") == "write_stdin":
+        message["name"] = "exec_session"
+        changed = True
+    tool_calls = cast(object, message.get("tool_calls"))
+    if isinstance(tool_calls, list):
+        for tool_call in cast(list[object], tool_calls):
+            changed = _migrate_legacy_exec_tool_call(tool_call) or changed
+    return changed
+
+
+def _migrate_legacy_exec_session_records(
+    messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> bool:
+    changed = False
+    for message in messages:
+        changed = _migrate_legacy_exec_message(message) or changed
+
+    checkpoint_value = cast(object, metadata.get(_RUNTIME_CHECKPOINT_KEY))
+    if not isinstance(checkpoint_value, dict):
+        return changed
+    checkpoint = cast(dict[str, Any], checkpoint_value)
+    assistant = cast(object, checkpoint.get("assistant_message"))
+    if isinstance(assistant, dict):
+        changed = _migrate_legacy_exec_message(cast(dict[str, Any], assistant)) or changed
+    pending = cast(object, checkpoint.get("pending_tool_calls"))
+    if isinstance(pending, list):
+        for tool_call in cast(list[object], pending):
+            changed = _migrate_legacy_exec_tool_call(tool_call) or changed
+    completed = cast(object, checkpoint.get("completed_tool_results"))
+    if isinstance(completed, list):
+        for result in cast(list[object], completed):
+            if isinstance(result, dict):
+                result_data = cast(dict[str, Any], result)
+                if result_data.get("name") == "write_stdin":
+                    result_data["name"] = "exec_session"
+                    changed = True
+    return changed
+
+
 def _is_provider_state_record_line(line: str) -> bool:
     """Recognize the canonical private record without decoding its opaque payload."""
     return _PROVIDER_STATE_RECORD_PREFIX_RE.match(line) is not None
@@ -172,7 +286,10 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    # Legacy storage name for the Memory ingestion watermark. New code should
+    # use ``last_archived`` so this progress is not confused with model-context
+    # compaction. Keep the field while persisted sessions and SDK callers migrate.
+    last_consolidated: int = 0
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     policy: SessionPolicy = field(default_factory=SessionPolicy, repr=False, compare=False)
 
@@ -189,6 +306,15 @@ class Session:
             or not 0 <= last_consolidated <= len(self.messages)
         ):
             self.last_consolidated = 0
+
+    @property
+    def last_archived(self) -> int:
+        """Number of transcript messages already written to the Memory journal."""
+        return self.last_consolidated
+
+    @last_archived.setter
+    def last_archived(self, value: int) -> None:
+        self.last_consolidated = value
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -214,9 +340,9 @@ class Session:
         A positive ``max_messages`` applies an explicit caller-owned count
         limit. The normal model path relies on ``max_tokens`` instead.
         """
-        replay_start = self.last_consolidated
+        replay_start = self.last_archived
         if replay_start:
-            # ``last_consolidated`` is archive progress, not a replay boundary.
+            # ``last_archived`` is archive progress, not a replay boundary.
             # Keep a small raw suffix for continuity, extending back to the user
             # that started an assistant/tool sequence when necessary.
             recent_start = recent_message_start_index(
@@ -230,8 +356,8 @@ class Session:
         if max_messages <= 0:
             start_idx = 0
         else:
-            unarchived_count = len(self.messages) - self.last_consolidated
-            if replay_start < self.last_consolidated and unarchived_count < max_messages:
+            unarchived_count = len(self.messages) - self.last_archived
+            if replay_start < self.last_archived and unarchived_count < max_messages:
                 # The archived replay suffix can exceed the nominal count when one
                 # tool-heavy turn spans the boundary. Preserve that complete turn.
                 start_idx = 0
@@ -354,7 +480,7 @@ class Session:
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
         self.messages = []
-        self.last_consolidated = 0
+        self.last_archived = 0
         self.provider_state = None
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
@@ -369,11 +495,11 @@ class Session:
 
         Returns a RetentionResult with dropped messages and how many of those
         were in the already-consolidated prefix. This method mutates
-        self.messages and self.last_consolidated in place.
+        self.messages and self.last_archived in place.
         """
         if max_messages <= 0:
             dropped = list(self.messages)
-            lc = self.last_consolidated
+            lc = self.last_archived
             self.clear()
             return RetentionResult(
                 dropped=dropped,
@@ -386,7 +512,7 @@ class Session:
             )
 
         original = list(self.messages)
-        before_lc = self.last_consolidated
+        before_lc = self.last_archived
 
         start_idx = max(0, len(self.messages) - max_messages)
         if extend_to_user:
@@ -446,7 +572,7 @@ class Session:
             if i < before_lc and id(m) not in retained_ids
         )
 
-        # New last_consolidated = count of retained messages that were inside
+        # New last_archived = count of retained messages that were inside
         # the old consolidated prefix.
         new_lc = sum(
             1 for i, m in enumerate(original)
@@ -454,7 +580,7 @@ class Session:
         )
 
         self.messages = retained
-        self.last_consolidated = new_lc
+        self.last_archived = new_lc
         if dropped:
             self.provider_state = None
         self.updated_at = datetime.now()
@@ -1062,12 +1188,7 @@ class JsonlSessionStore:
                             if isinstance(updated_at_value, str) and updated_at_value
                             else None
                         )
-                        offset = cast(object, data.get("last_consolidated", 0))
-                        last_consolidated = (
-                            offset
-                            if isinstance(offset, int) and not isinstance(offset, bool)
-                            else 0
-                        )
+                        last_consolidated = _archive_offset(data)
                     elif record_type == _PROVIDER_STATE_RECORD_TYPE:
                         provider_state = ProviderConversationState.from_private_record(
                             data.get("state")
@@ -1085,6 +1206,8 @@ class JsonlSessionStore:
                 provider_state=provider_state,
             )
             self._overlay_runtime_checkpoint_unlocked(session, path)
+            if _migrate_legacy_exec_session_records(session.messages, session.metadata):
+                session.provider_state = None
             return session
         except _SESSION_DATA_ERRORS as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -1147,12 +1270,7 @@ class JsonlSessionStore:
                         if isinstance(updated_at_value, str) and updated_at_value:
                             with suppress(ValueError):
                                 updated_at = datetime.fromisoformat(updated_at_value)
-                        offset = cast(object, data.get("last_consolidated", 0))
-                        last_consolidated = (
-                            offset
-                            if isinstance(offset, int) and not isinstance(offset, bool)
-                            else 0
-                        )
+                        last_consolidated = _archive_offset(data)
                     elif record_type == _PROVIDER_STATE_RECORD_TYPE:
                         candidate = ProviderConversationState.from_private_record(
                             data.get("state")
@@ -1180,6 +1298,8 @@ class JsonlSessionStore:
                 provider_state=provider_state,
             )
             self._overlay_runtime_checkpoint_unlocked(session, path)
+            if _migrate_legacy_exec_session_records(session.messages, session.metadata):
+                session.provider_state = None
             return session
         except _SESSION_DATA_ERRORS as e:
             logger.warning("Repair failed for session {}: {}", key, e)
@@ -1310,6 +1430,9 @@ class JsonlSessionStore:
                     "created_at": session.created_at.isoformat(),
                     "updated_at": session.updated_at.isoformat(),
                     "metadata": session.metadata,
+                    "last_archived": session.last_archived,
+                    # Keep old nanobot releases able to read sessions written
+                    # during the field-name migration.
                     "last_consolidated": session.last_consolidated,
                 }
                 f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
@@ -1454,6 +1577,7 @@ class JsonlSessionStore:
                         continue
                     else:
                         messages.append(data)
+            _migrate_legacy_exec_session_records(messages, metadata)
             return {
                 "key": stored_key or key,
                 "created_at": created_at,
@@ -1901,8 +2025,8 @@ class SessionManager:
         for key in _FORK_VOLATILE_METADATA_KEYS:
             metadata.pop(key, None)
 
-        last_consolidated = min(source.last_consolidated, len(copied))
-        if source.last_consolidated > len(copied):
+        last_consolidated = min(source.last_archived, len(copied))
+        if source.last_archived > len(copied):
             metadata.pop("_last_summary", None)
             last_consolidated = 0
 

@@ -23,6 +23,7 @@ from nanobot.session.automation_turns import is_automation_kind
 from nanobot.session.history_visibility import is_hidden_history_message
 from nanobot.session.manager import SessionManager
 from nanobot.webui.metadata import WEBUI_MESSAGE_SOURCE_METADATA_KEY, WEBUI_TURN_METADATA_KEY
+from nanobot.webui.session_identity import webui_chat_id, webui_session_key
 
 WEBUI_TRANSCRIPT_SCHEMA_VERSION = 3
 WEBUI_FORK_MARKER_EVENT = "fork_marker"
@@ -828,7 +829,7 @@ class WebUITranscriptRecorder:
     def append(self, chat_id: str, event: dict[str, Any]) -> bool:
         try:
             dup = json.loads(json.dumps(event, ensure_ascii=False))
-            append_transcript_object(f"websocket:{chat_id}", dup)
+            append_transcript_object(webui_session_key(chat_id), dup)
         except (OSError, ValueError, TypeError) as e:
             self._log.warning("webui transcript append failed: {}", e)
             return False
@@ -860,10 +861,10 @@ class WebUITranscriptRecorder:
 
 
 def _chat_id_from_session_key(session_key: str) -> str | None:
-    if not session_key.startswith("websocket:"):
+    chat_id = webui_chat_id(session_key)
+    if chat_id is None:
         return None
-    chat_id = session_key.split(":", 1)[1].strip()
-    return chat_id or None
+    return chat_id.strip() or None
 
 
 def _is_user_transcript_row(row: dict[str, Any]) -> bool:
@@ -1813,24 +1814,20 @@ def replay_transcript_to_ui_messages(
                 break
             content = str(candidate.get("content") or "")
             has_answer = len(content) > 0
+            if has_answer:
+                break
+            # A completed reasoning field is closed even while its assistant
+            # placeholder remains streaming for the rest of the turn.
             if (
                 candidate.get("reasoningStreaming")
-                or candidate.get("reasoning") is not None
-                or has_answer
-                or candidate.get("isStreaming")
+                or (
+                    candidate.get("isStreaming")
+                    and candidate.get("reasoning") is None
+                )
             ):
                 prev[i] = {
                     **candidate,
                     "reasoning": (str(candidate.get("reasoning") or "")) + chunk,
-                    "reasoningStreaming": True,
-                    "activitySegmentId": candidate.get("activitySegmentId") or _ensure_activity_segment(),
-                    **turn_fields,
-                }
-                return
-            if not has_answer and candidate.get("isStreaming"):
-                prev[i] = {
-                    **candidate,
-                    "reasoning": chunk,
                     "reasoningStreaming": True,
                     "activitySegmentId": candidate.get("activitySegmentId") or _ensure_activity_segment(),
                     **turn_fields,
@@ -1914,19 +1911,6 @@ def replay_transcript_to_ui_messages(
             and not m.get("reasoningStreaming")
             and not m.get("media")
         )
-
-    def is_tool_trace_at(index: int) -> bool:
-        m = messages[index] if 0 <= index < len(messages) else None
-        return bool(m and m.get("kind") == "trace")
-
-    def prune_reasoning_only() -> None:
-        nonlocal messages
-        kept: list[dict[str, Any]] = []
-        for i, m in enumerate(messages):
-            if is_reasoning_only_placeholder(m) and not is_tool_trace_at(i + 1):
-                continue
-            kept.append(m)
-        messages = kept
 
     def stamp_completion(
         *,
@@ -2442,7 +2426,6 @@ def replay_transcript_to_ui_messages(
             for i, m in enumerate(messages):
                 if m.get("isStreaming"):
                     messages[i] = {**m, "isStreaming": False}
-            prune_reasoning_only()
             lat = rec.get("latency_ms")
             usage = rec.get("usage")
             sanitized_usage = (
