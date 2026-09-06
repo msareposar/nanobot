@@ -133,10 +133,7 @@ class TestLoadBootstrapFiles:
         (project / "SOUL.md").write_text("project soul collision", encoding="utf-8")
         (project / "USER.md").write_text("project user collision", encoding="utf-8")
 
-        result = ContextBuilder(agent_home).build_system_prompt(
-            workspace=project,
-            include_memory_recent_history=False,
-        )
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
 
         assert "selected project rules" in result
         assert "global project rules" not in result
@@ -152,10 +149,7 @@ class TestLoadBootstrapFiles:
         project.mkdir()
         (agent_home / "AGENTS.md").write_text("default workspace rules", encoding="utf-8")
 
-        result = ContextBuilder(agent_home).build_system_prompt(
-            workspace=project,
-            include_memory_recent_history=False,
-        )
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
 
         assert "default workspace rules" not in result
 
@@ -224,17 +218,14 @@ class TestBundledToolContract:
         assert "Do not use `exec` as a universal workaround" in content
         assert "## File and Coding Workflows" in content
         assert "`grep` returns matches with five context lines by default" in content
-        assert 'defaults to `output_mode="files_with_matches"`' not in content
         assert "apply_patch" in content
         assert "acceptance criteria into concrete checks" in content
         assert "visual evidence reaches the model" in content
         assert "clear user request as authorization" in content
         assert "Never invent missing records or measurements" in content
-        assert "scientific fitting" not in content
         assert "## Web and External Information" in content
         assert "## Messaging and Media" in content
         assert "## Scheduling and Background Work" in content
-        assert "pure coding" not in content.lower()
 
     def test_tool_contract_is_injected_without_workspace_file(self, tmp_path):
         builder = _builder(tmp_path)

@@ -22,6 +22,7 @@ from nanobot.runtime_context import (
 )
 from nanobot.session.goal_state import GOAL_STATE_KEY
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.utils.progress_events import output_events
 
 _MAX_TOOL_RESULT_CHARS = AgentDefaults().max_tool_result_chars
 _GOAL_RUNTIME_GUIDANCE_TAG = "[Goal Runtime Guidance — host instructions]"
@@ -112,7 +113,6 @@ async def test_goal_command_can_implement_plan_from_prior_discussion(tmp_path):
         LLMResponse(content="done", tool_calls=[], usage=None),
     ])
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
-    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
     session = loop.sessions.get_or_create("cli:direct")
     session.add_message("user", "Let's agree on the migration implementation.")
     session.add_message("assistant", "Use the staged migration plan and run integration tests.")
@@ -166,7 +166,6 @@ async def test_runtime_context_is_persisted_as_next_turn_prompt_prefix(tmp_path)
         LLMResponse(content="second answer", usage=None),
     ])
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
-    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
     session = loop.sessions.get_or_create("cli:direct")
     provider_calls: list[str | None] = []
 
@@ -220,7 +219,6 @@ async def test_webui_quote_reaches_model_without_leaking_into_public_history(tmp
     provider.generation = GenerationSettings()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="answer", usage=None))
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
-    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
     session = loop.sessions.get_or_create("websocket:chat")
     quote = webui_quote_runtime_context({
         WEBUI_QUOTE_METADATA: "the selected answer excerpt",
@@ -265,7 +263,6 @@ async def test_runtime_context_provider_runs_once_across_tool_iterations(tmp_pat
         LLMResponse(content="done", usage=None),
     ])
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
-    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
     provider_calls = 0
 
     async def provide_context(_request):
@@ -310,7 +307,6 @@ async def test_non_goal_direct_turn_cannot_reuse_prior_goal_command(tmp_path):
         LLMResponse(content="handled as a one-time task", tool_calls=[], usage=None),
     ])
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
-    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
     session = loop.sessions.get_or_create("api:default")
     session.add_message("user", "/goal old completed request")
     session.add_message("assistant", "The old request is complete.")
@@ -405,8 +401,8 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
     result = await loop._run_agent_loop(
         TranscriptInput(history=[], current_message=None),
         runtime=loop.llm_runtime(),
-        on_stream=on_stream,
-        on_stream_end=on_stream_end,
+        events=output_events(on_stream=on_stream, on_stream_end=on_stream_end),
+        streaming=True,
     )
 
     assert result.final_content == "Hello"
@@ -432,7 +428,8 @@ async def test_loop_stream_filter_hides_partial_trailing_think_prefix(tmp_path):
     result = await loop._run_agent_loop(
         TranscriptInput(history=[], current_message=None),
         runtime=loop.llm_runtime(),
-        on_stream=on_stream,
+        events=output_events(on_stream=on_stream),
+        streaming=True,
     )
 
     assert result.final_content == "Hello World"
@@ -457,7 +454,8 @@ async def test_loop_stream_filter_hides_complete_trailing_think_tag(tmp_path):
     result = await loop._run_agent_loop(
         TranscriptInput(history=[], current_message=None),
         runtime=loop.llm_runtime(),
-        on_stream=on_stream,
+        events=output_events(on_stream=on_stream),
+        streaming=True,
     )
 
     assert result.final_content == "Hello World"
@@ -589,7 +587,6 @@ async def test_next_turn_after_llm_error_keeps_turn_boundary(tmp_path):
 
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
     loop.tools.get_definitions = MagicMock(return_value=[])
-    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
 
     first = await loop._process_message(
         InboundMessage(channel="cli", sender_id="user", chat_id="test", content="first question")
