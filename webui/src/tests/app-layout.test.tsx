@@ -265,6 +265,7 @@ vi.mock("@/lib/nanobot-client", async (importOriginal) => {
     };
     getRunStartedAt = () => null;
     getRunTurnId = () => null;
+    fenceCanonicalCompletedTurns = vi.fn();
     getGoalState = () => undefined;
     sendMessage = sendMessageSpy;
     newChat = vi.fn();
@@ -287,8 +288,10 @@ import {
   fetchBootstrap,
 } from "@/lib/bootstrap";
 import App from "@/App";
+import { mockBrowserFocus } from "./browser-focus";
 
 describe("App layout", () => {
+  let restoreBrowserFocus: (() => void) | undefined;
   beforeEach(async () => {
     await i18n.changeLanguage("en");
     mockSessions = [];
@@ -342,9 +345,21 @@ describe("App layout", () => {
 
   afterEach(() => {
     cleanup();
+    restoreBrowserFocus?.();
+    restoreBrowserFocus = undefined;
     Reflect.deleteProperty(window, "nanobotHost");
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("shows only layout shadows while bootstrap is pending", () => {
+    vi.mocked(fetchBootstrap).mockReturnValueOnce(new Promise(() => {}));
+    render(<App />);
+    expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveClass("startup-status");
+    expect(screen.queryByText("Loading nanobot…")).not.toBeInTheDocument();
   });
 
   it("shows the auth form without an invalid-password error on first load", async () => {
@@ -357,21 +372,73 @@ describe("App layout", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Connect to nanobot" }))
       .toBeInTheDocument();
     const password = screen.getByLabelText("WebUI password");
-    expect(screen.getByText(/channels\.websocket\.tokenIssueSecret/))
-      .toBeInTheDocument();
-    expect(password).toHaveAccessibleDescription(
-      /If that value is empty, use channels\.websocket\.token\./,
-    );
+    expect(password).not.toHaveAttribute("aria-describedby");
     expect(password).toHaveAttribute(
       "autocomplete",
       "current-password",
     );
     expect(password).not.toHaveAttribute("placeholder");
-    expect(screen.queryByText("Authentication required")).not.toBeInTheDocument();
-    expect(
-      screen.queryByText(/WebUI password wasn't accepted/),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("switches language before connecting while preserving the password draft", async () => {
+    vi.mocked(fetchBootstrap).mockRejectedValueOnce(
+      new Error("bootstrap failed: HTTP 401"),
+    );
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await user.type(await screen.findByLabelText("WebUI password"), "draft-password");
+    await user.tab({ shift: true });
+    expect(screen.getByRole("combobox", { name: "Change language" })).toHaveFocus();
+    await user.keyboard("{Enter}");
+    await screen.findByRole("listbox");
+    await user.keyboard("{ArrowDown}{Enter}");
+
+    expect(await screen.findByRole("heading", { name: "连接到 nanobot" }))
+      .toBeInTheDocument();
+    expect(screen.getByLabelText("WebUI 密码")).toHaveValue("draft-password");
+    expect(screen.getByRole("button", { name: "连接", exact: true })).toBeEnabled();
+    expect(document.documentElement.lang).toBe("zh-CN");
+    expect(localStorage.getItem("nanobot.locale")).toBe("zh-CN");
+    expect(fetchBootstrap).toHaveBeenCalledTimes(1);
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("reveals password setup help with the keyboard without submitting the form", async () => {
+    vi.mocked(fetchBootstrap).mockRejectedValueOnce(
+      new Error("bootstrap failed: HTTP 401"),
+    );
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    const password = await screen.findByLabelText("WebUI password");
+    await user.type(password, "draft-password");
+    await user.tab();
+    await user.tab();
+    await user.tab();
+    const help = screen.getByRole("button", { name: "Where can I find the password?" });
+    expect(help).toHaveFocus();
+    expect(help).toHaveAttribute("aria-expanded", "false");
+    const content = document.getElementById(help.getAttribute("aria-controls")!);
+    expect(content).toHaveAttribute("aria-hidden", "true");
+
+    await user.keyboard("{Enter}");
+
+    expect(help).toHaveAttribute("aria-expanded", "true");
+    expect(content).not.toHaveAttribute("aria-hidden");
+    expect(content).toHaveTextContent("~/.nanobot/config.json");
+    expect(content).toHaveTextContent("channels.websocket.tokenIssueSecret");
+    expect(content).toHaveTextContent("If that value is empty, use channels.websocket.token.");
+
+    await user.keyboard(" ");
+
+    expect(help).toHaveAttribute("aria-expanded", "false");
+    expect(password).toHaveValue("draft-password");
+    expect(fetchBootstrap).toHaveBeenCalledTimes(1);
   });
 
   it("toggles password visibility without changing the password", async () => {
@@ -413,14 +480,19 @@ describe("App layout", () => {
     fireEvent.click(connect);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Enter the WebUI password.",
+      "Enter password",
     );
+    expect(password).toHaveAttribute("placeholder", "Enter password");
     expect(password).toHaveAttribute("aria-invalid", "true");
     expect(password).toHaveAttribute(
       "aria-describedby",
-      "webui-auth-help webui-auth-error",
+      "webui-auth-error",
     );
     expect(password).toHaveFocus();
+    fireEvent.change(password, { target: { value: "   " } });
+    fireEvent.click(connect);
+    expect(password).toHaveValue("");
+    expect(password).toHaveAttribute("placeholder", "Enter password");
     expect(fetchBootstrap).toHaveBeenCalledTimes(1);
   });
 
@@ -435,9 +507,7 @@ describe("App layout", () => {
 
     expect(await screen.findByRole("heading", { level: 1, name: "Connect to nanobot" }))
       .toBeInTheDocument();
-    expect(
-      screen.queryByText(/WebUI password wasn't accepted/),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(connectSpy).not.toHaveBeenCalled();
   });
 
@@ -454,12 +524,47 @@ describe("App layout", () => {
 
     const retryPassword = await screen.findByLabelText("WebUI password");
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "That WebUI password wasn't accepted. Copy it from the nanobot config and try again.",
+      "Incorrect password",
     );
+    expect(retryPassword).toHaveAttribute("placeholder", "Incorrect password");
+    expect(retryPassword).toHaveValue("");
     expect(retryPassword).toHaveAttribute("aria-invalid", "true");
     expect(retryPassword).toHaveFocus();
     expect(fetchBootstrap).toHaveBeenLastCalledWith("", "wrong-password");
     expect(connectSpy).not.toHaveBeenCalled();
+    fireEvent.change(retryPassword, { target: { value: "retry-password" } });
+    expect(retryPassword).not.toHaveAttribute("placeholder");
+    expect(retryPassword).not.toHaveAttribute("aria-invalid");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("clears auth feedback after three seconds without moving focus", async () => {
+    vi.mocked(fetchBootstrap).mockRejectedValue(
+      new Error("bootstrap failed: HTTP 401"),
+    );
+    render(<App />);
+    const password = await screen.findByLabelText("WebUI password");
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    expect(password).toHaveAttribute("placeholder", "Enter password");
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(password).not.toHaveAttribute("placeholder");
+    expect(password).toHaveFocus();
+
+    await act(async () => {
+      fireEvent.change(password, { target: { value: "wrong-password" } });
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    });
+    const retryPassword = screen.getByLabelText("WebUI password");
+    expect(retryPassword).toHaveAttribute("placeholder", "Incorrect password");
+    act(() => vi.advanceTimersByTime(2_999));
+    expect(retryPassword).toHaveAttribute("placeholder", "Incorrect password");
+    act(() => vi.advanceTimersByTime(1));
+    expect(retryPassword).not.toHaveAttribute("placeholder");
+    expect(retryPassword).not.toHaveAttribute("aria-invalid");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(retryPassword).toHaveFocus();
   });
 
   it("keeps sidebar layout out of the main thread width contract", async () => {
@@ -529,7 +634,7 @@ describe("App layout", () => {
       await screen.findByRole("navigation", { name: "Settings sections" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Model providers")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add your own model provider" }))
+    expect(screen.getByRole("button", { name: "Add provider" }))
       .toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Choose your AI" })).not.toBeInTheDocument();
   });
@@ -964,6 +1069,56 @@ describe("App layout", () => {
     expect(window.location.hash).toBe("#/settings?section=channels");
   });
 
+  it("refreshes settings after the browser reconnects from a restart", async () => {
+    let restartCompleted = false;
+    let refreshedSettingsRequests = 0;
+    let releaseRefreshedSettings!: () => void;
+    const refreshedSettingsReady = new Promise<void>((resolve) => {
+      releaseRefreshedSettings = resolve;
+    });
+    const pendingSettings = {
+      ...baseSettingsPayload(),
+      requires_restart: true,
+      restart_required_sections: ["runtime"],
+    };
+    const refreshedSettings = {
+      ...baseSettingsPayload(),
+      requires_restart: false,
+      restart_required_sections: [],
+    };
+    localStorage.setItem("nanobot-webui.restartStartedAt", String(Date.now() - 2_000));
+    window.history.replaceState(null, "", "/#/settings?section=runtime");
+    mockFetchRoutes({
+      "/api/settings": () => {
+        if (!restartCompleted) return pendingSettings;
+        refreshedSettingsRequests += 1;
+        if (refreshedSettingsRequests === 1) throw new Error("gateway is still starting");
+        return refreshedSettingsReady.then(() => refreshedSettings);
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Saved. Restart to apply changes.").length).toBeGreaterThan(0);
+    }, { timeout: 10_000 });
+
+    restartCompleted = true;
+    act(() => {
+      for (const handler of statusHandlers) handler("reconnecting");
+      for (const handler of statusHandlers) handler("open");
+    });
+
+    await waitFor(() => expect(refreshedSettingsRequests).toBeGreaterThan(1));
+    await act(async () => {
+      releaseRefreshedSettings();
+      await refreshedSettingsReady;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
+    await waitFor(() => expect(window.location.hash).toBe("#/new"));
+    expect(await screen.findByText(HERO_GREETING_PATTERN, {}, { timeout: 10_000 })).toBeInTheDocument();
+  }, 30_000);
+
   it("opens Skills from the main sidebar", async () => {
     const longSkillDescription = [
       "Work with GitHub repositories, issues, pull requests, releases, workflows,",
@@ -1114,6 +1269,7 @@ describe("App layout", () => {
     expect(screen.getByText(/Use GitHub CLI/)).toBeInTheDocument();
     const enabledSwitch = screen.getByRole("switch", { name: "Disable github" });
     expect(enabledSwitch).toHaveAttribute("aria-checked", "true");
+    expect(enabledSwitch).toHaveClass("h-5", "w-9", "bg-foreground");
     fireEvent.click(enabledSwitch);
     await waitFor(() => {
       expect(screen.getByRole("switch", { name: "Enable github" })).toHaveAttribute(
@@ -1121,6 +1277,7 @@ describe("App layout", () => {
         "false",
       );
     });
+    expect(screen.getByRole("switch", { name: "Enable github" })).toHaveClass("h-5", "w-9", "bg-muted-foreground/25");
   });
 
   it("deletes a custom skill from its detail sheet", async () => {
@@ -2106,6 +2263,43 @@ describe("App layout", () => {
     expect(deleteChatSpy).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("Daily repo check")).not.toBeInTheDocument();
   }, 15_000);
+
+  it("opens a mobile topic with one click and closes the drawer without a search tooltip", async () => {
+    restoreBrowserFocus = mockBrowserFocus();
+    const user = userEvent.setup();
+    mockSessions = ["First", "Second"].map((title, index) => ({
+      key: `websocket:mobile-${index}`,
+      channel: "websocket",
+      chatId: `mobile-${index}`,
+      createdAt: "2026-04-16T10:00:00Z",
+      updatedAt: "2026-04-16T10:00:00Z",
+      preview: `${title} mobile chat`,
+    }));
+    vi.stubGlobal("matchMedia", vi.fn().mockImplementation((query: string) => ({
+      matches: !query.includes("1024px"),
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })));
+
+    render(<App />);
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    for (const title of ["First", "Second"]) {
+      await user.click(await screen.findByRole("button", { name: "Toggle sidebar" }));
+      const sheet = await screen.findByRole("dialog");
+      await waitFor(() => expect(sheet).toHaveFocus());
+      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+      await user.click(await within(sheet).findByRole("button", { name: `${title} mobile chat` }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      await waitFor(() => expect(document.title).toBe(`${title} mobile chat · nanobot`));
+      expect(screen.getByRole("button", { name: `${title} mobile chat` }))
+        .toHaveAttribute("aria-current", "page");
+    }
+  });
 
   it("keeps the mobile session action menu inside the sidebar sheet", async () => {
     mockSessions = [

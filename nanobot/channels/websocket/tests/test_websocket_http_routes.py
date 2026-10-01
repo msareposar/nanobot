@@ -331,7 +331,14 @@ async def test_sessions_list_and_thread_restore_transcript_without_canonical_fil
         assert [row["key"] for row in listing.json()["sessions"]] == [key]
         assert listing.json()["sessions"][0]["preview"] == "original question"
         assert thread.status_code == 200
-        assert [message["content"] for message in thread.json()["messages"]] == [
+        body = thread.json()
+        assert body["projection"] == "events"
+        assert "messages" not in body
+        assert [
+            event["text"]
+            for event in body["events"]
+            if event["event"] in {"user_message", "message", "stream_end"}
+        ] == [
             "original question",
             "original answer",
         ]
@@ -2384,6 +2391,7 @@ async def test_session_delete_removes_unpersisted_new_chat(
     channel = _ch(bus, session_manager=sm, workspace_path=tmp_path, port=_free_port())
     connection = AsyncMock()
     connection.remote_address = ("127.0.0.1", 50123)
+    connection.request.headers = {"Host": "localhost"}
 
     await channel._dispatch_envelope(
         connection,
@@ -2414,6 +2422,60 @@ async def test_session_delete_removes_unpersisted_new_chat(
     assert response.status_code == 200
     assert response.json()["deleted"] is True
     assert channel.gateway.workspaces.scope_for_session_key(key).project_path == tmp_path.resolve()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["every", "cron", "at"])
+async def test_webui_automation_edit_keeps_pending_run(bus, tmp_path, monkeypatch, kind):
+    now = 1_900_000_000_000
+    monkeypatch.setattr("nanobot.cron.service._now_ms", lambda: now)
+    schedules = {
+        "every": CronSchedule(kind="every", every_ms=60_000),
+        "cron": CronSchedule(kind="cron", expr="* * * * *", tz="UTC"),
+        "at": CronSchedule(kind="at", at_ms=now + 60_000),
+    }
+    cron = CronService(tmp_path / "cron" / "jobs.json")
+    job = cron.add_job(
+        name="Report",
+        schedule=schedules[kind],
+        message="Write the report",
+        session_key="websocket:report",
+        origin_channel="websocket",
+        origin_chat_id="report",
+    )
+    due_at = job.state.next_run_at_ms
+    assert due_at is not None
+    now = due_at + 1_000
+    channel = _ch(bus, cron_service=cron, workspace_path=tmp_path)
+    try:
+        response = await _webui_mutate(
+            channel,
+            "automation.update",
+            {
+                "id": job.id,
+                "values": {
+                    "name": "Updated report",
+                    "message": "Include the latest figures",
+                    "schedule": {
+                        "kind": kind,
+                        "every_ms": job.schedule.every_ms,
+                        "at_ms": job.schedule.at_ms,
+                        "expr": job.schedule.expr,
+                        "tz": job.schedule.tz,
+                    },
+                },
+            },
+        )
+        assert response.status_code == 200
+        row = next(item for item in response.json()["jobs"] if item["id"] == job.id)
+        assert row["name"] == "Updated report"
+        assert row["payload"]["message"] == "Include the latest figures"
+        assert row["state"]["next_run_at_ms"] == due_at
+        persisted = CronService(cron.store_path).get_job(job.id)
+        assert persisted is not None
+        assert persisted.state.next_run_at_ms == due_at
+    finally:
+        await channel.stop()
 
 
 @pytest.mark.asyncio
@@ -2468,6 +2530,76 @@ async def test_webui_automation_result_is_authenticated_and_returns_only_selecte
         await server_task
 
 
+@pytest.mark.asyncio
+async def test_remote_new_chat_accepts_server_project_path_but_rejects_remote_full_access(
+    bus: MagicMock, tmp_path: Path
+) -> None:
+    project = tmp_path / "remote-project"
+    other_project = tmp_path / "other-project"
+    project.mkdir()
+    other_project.mkdir()
+    channel = _ch(bus, workspace_path=tmp_path, port=_free_port())
+    connection = AsyncMock()
+    connection.remote_address = ("192.168.1.5", 50123)
+    connection.request = _FakeReq(
+        {
+            "Host": "nas.example",
+            "X-Forwarded-For": "203.0.113.42",
+        }
+    )
+
+    await channel._dispatch_envelope(
+        connection,
+        "remote-webui",
+        {
+            "type": "new_chat",
+            "workspace_scope": {
+                "project_path": str(project),
+                "access_mode": "restricted",
+            },
+        },
+    )
+
+    attached = next(
+        payload
+        for payload in (
+            json.loads(call.args[0]) for call in connection.send.await_args_list
+        )
+        if payload.get("event") == "attached"
+    )
+    key = f"websocket:{attached['chat_id']}"
+    scope = channel.gateway.workspaces.scope_for_session_key(key)
+    assert scope.project_path == project.resolve()
+    assert scope.access_mode == "restricted"
+
+    connection.send.reset_mock()
+    await channel._dispatch_envelope(
+        connection,
+        "remote-webui",
+        {
+            "type": "new_chat",
+            "workspace_scope": {
+                "project_path": str(other_project),
+                "access_mode": "full",
+            },
+        },
+    )
+
+    rejected = [
+        json.loads(call.args[0])
+        for call in connection.send.await_args_list
+        if json.loads(call.args[0]).get("event") == "error"
+    ]
+    assert rejected == [
+        {
+            "event": "error",
+            "detail": "workspace_scope_rejected",
+            "reason": "full workspace access is unavailable for this connection",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_webui_automations_route_lists_all_jobs_and_allows_user_actions(
     bus: MagicMock, tmp_path: Path
 ) -> None:
@@ -3028,8 +3160,11 @@ async def test_webui_thread_resigns_assistant_media_urls(
             headers=auth,
         )
         assert resp.status_code == 200
-        assistant = next(m for m in resp.json()["messages"] if m["role"] == "assistant")
-        media = assistant["media"]
+        body = resp.json()
+        assert body["projection"] == "events"
+        assert "messages" not in body
+        assistant = next(event for event in body["events"] if event["event"] == "message")
+        media = assistant["media_urls"]
         assert media[0]["kind"] == "video"
         assert media[0]["name"] == "clip.mp4"
         assert media[0]["url"].startswith("/api/media/")
@@ -3040,10 +3175,10 @@ async def test_webui_thread_resigns_assistant_media_urls(
             headers=auth,
         )
         repeated_assistant = next(
-            m for m in repeated.json()["messages"] if m["role"] == "assistant"
+            event for event in repeated.json()["events"] if event["event"] == "message"
         )
-        assert repeated_assistant["id"] == assistant["id"]
-        assert repeated_assistant["media"][0]["url"] == media[0]["url"]
+        assert repeated_assistant["projection_id"] == assistant["projection_id"]
+        assert repeated_assistant["media_urls"][0]["url"] == media[0]["url"]
         assert len(list(websocket_media.iterdir())) == 1
 
         fetched = await _http_get(f"http://127.0.0.1:29914{media[0]['url']}")
@@ -3119,7 +3254,10 @@ async def test_webui_thread_complete_transcript_skips_session_history_read(
         )
 
         assert response.status_code == 200
-        assert [message["content"] for message in response.json()["messages"]] == [
+        body = response.json()
+        assert body["projection"] == "events"
+        assert "messages" not in body
+        assert [event["text"] for event in body["events"] if "text" in event] == [
             "hi",
             "hello back",
         ]
@@ -3166,7 +3304,9 @@ async def test_webui_thread_negotiates_gzip_for_large_payloads(
         assert compressed.headers["Content-Encoding"] == "gzip"
         assert compressed.headers["Vary"] == "Accept-Encoding"
         assert int(compressed.headers["Content-Length"]) < len(compressed.content)
-        assert compressed.json()["messages"][0]["content"].startswith("compress me")
+        assert compressed.json()["projection"] == "events"
+        assert "messages" not in compressed.json()
+        assert compressed.json()["events"][0]["text"].startswith("compress me")
 
         identity = await _http_get(
             url,
@@ -3224,10 +3364,12 @@ async def test_webui_thread_revalidates_and_loads_large_trace_details(
         assert first.status_code == 200
         assert first.headers["Cache-Control"] == "no-store"
         assert first.headers["ETag"] == f'"{first.json()["revision"]}"'
-        trace_message = next(
-            message for message in first.json()["messages"] if message.get("kind") == "trace"
+        assert first.json()["projection"] == "events"
+        assert "messages" not in first.json()
+        trace_event = next(
+            event for event in first.json()["events"] if event.get("kind") == "progress"
         )
-        assert trace_message["content"] == "exec(…)"
+        assert trace_event["text"] == "exec(…)"
 
         unchanged = await _http_get(
             url,
@@ -3239,11 +3381,12 @@ async def test_webui_thread_revalidates_and_loads_large_trace_details(
         detail = await _http_get(
             f"http://127.0.0.1:{port}/api/sessions/"
             "websocket%3Arevalidated-thread/webui-thread/trace-detail"
-            f"?ref={trace_message['traceDetail']['ref']}",
+            f"?ref={trace_event['trace_detail']['ref']}",
             headers=auth,
         )
         assert detail.status_code == 200
-        assert detail.json()["content"] == trace
+        assert detail.json()["message_id"] == trace_event["projection_id"]
+        assert detail.json()["events"][0]["text"] == trace
 
         append_transcript_object(
             key,
@@ -3533,6 +3676,54 @@ async def test_workspace_folder_picker_is_local_authenticated_mutation(
     assert response.status_code == 200
     assert response.json() == {"path": str(selected)}
     pick_folder.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize(
+    ("connection", "headers", "can_use_full_access", "can_pick_folder"),
+    [
+        (
+            _REMOTE,
+            {"Host": "nas.example", "X-Forwarded-For": "203.0.113.42"},
+            False,
+            False,
+        ),
+        (
+            _LOCAL,
+            {"Host": "nas.example", "X-Forwarded-For": "203.0.113.42"},
+            False,
+            False,
+        ),
+        (_LOCAL, {"Host": "127.0.0.1:8765"}, True, True),
+    ],
+)
+@pytest.mark.parametrize("native_picker_available", [True, False])
+def test_workspace_payload_separates_remote_project_selection_from_full_access(
+    bus: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    native_picker_available: bool,
+    connection: _FakeConn,
+    headers: dict[str, str],
+    can_use_full_access: bool,
+    can_pick_folder: bool,
+) -> None:
+    monkeypatch.setattr(
+        "nanobot.webui.ws_http.native_folder_picker_available",
+        lambda: native_picker_available,
+    )
+    channel = _ch(bus)
+    token = channel.gateway.tokens.issue_api_token(300)
+    request = _FakeReq(
+        {"Authorization": f"Bearer {token}", **headers},
+        path="/api/workspaces",
+    )
+
+    response = channel.gateway.http._handle_workspaces(connection, request)
+
+    assert response.status_code == 200
+    controls = json.loads(response.body.decode())["controls"]
+    assert controls["can_change_project"] is True
+    assert controls["can_use_full_access"] is can_use_full_access
+    assert controls["can_pick_folder"] is (can_pick_folder and native_picker_available)
 
 
 @pytest.mark.asyncio
@@ -4013,3 +4204,33 @@ def test_bootstrap_secret_also_enforced_on_localhost(bus: MagicMock) -> None:
     channel = _ch(bus, host="0.0.0.0", tokenIssueSecret="s3cret")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _NO_HEADERS)
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_star_prompt_requires_authenticated_mutation_and_persists_dismissal(
+    bus: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nanobot.webui.star_prompt import StarPromptState
+
+    monkeypatch.setattr("nanobot.config.paths.get_data_dir", lambda: tmp_path)
+    state_path = tmp_path / "webui" / "star-prompt.json"
+    state_path.parent.mkdir()
+    state_path.write_text(StarPromptState(
+        completed_replies=10, active_days=["2026-09-20", "2026-09-21", "2026-09-22"]
+    ).model_dump_json(), encoding="utf-8")
+    channel = _ch(bus, port=29912)
+    server_task = asyncio.create_task(channel.start())
+    try:
+        raw = await _http_get("http://127.0.0.1:29912/api/webui/star-prompt/claim")
+        assert raw.status_code in {401, 405}
+        first = await _webui_mutate(channel, "star_prompt.claim", {})
+        assert first.status_code == 200
+        assert first.json() == {"show": True}
+        second = await _webui_mutate(channel, "star_prompt.claim", {})
+        assert second.json() == {"show": False}
+        dismissed = await _webui_mutate(channel, "star_prompt.dismiss", {})
+        assert dismissed.status_code == 200
+        assert StarPromptState.model_validate_json(state_path.read_text()).dismissed_forever
+    finally:
+        await channel.stop()
+        await server_task

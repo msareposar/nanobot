@@ -245,7 +245,7 @@ class TestDreamTools:
         )
 
         assert "Patch applied" in memory_result
-        assert "Successfully edited" in soul_result
+        assert "Patch applied" in soul_result
         assert "Successfully wrote" in user_result
         assert "Project Y active" in store.memory_file.read_text(encoding="utf-8")
         assert "Precise" in store.soul_file.read_text(encoding="utf-8")
@@ -396,6 +396,7 @@ class TestEphemeralDirect:
         provider.get_default_model.return_value = "test-model"
         provider.supports_tools = True
         provider.generation = MagicMock(max_tokens=4096)
+        provider.estimate_prompt_tokens.return_value = (100, "test")
         provider.chat_stream_with_retry = AsyncMock(
             return_value=LLMResponse(content="done", tool_calls=[], finish_reason="stop", usage=None)
         )
@@ -671,6 +672,7 @@ class TestEphemeralHooks:
         provider.get_default_model.return_value = "test-model"
         provider.supports_tools = True
         provider.generation = MagicMock(max_tokens=4096)
+        provider.estimate_prompt_tokens.return_value = (100, "test")
         provider.chat_stream_with_retry = AsyncMock(
             return_value=LLMResponse(
                 content="done", finish_reason="stop", tool_calls=[], usage=None,

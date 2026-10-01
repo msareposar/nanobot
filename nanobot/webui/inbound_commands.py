@@ -37,6 +37,12 @@ from nanobot.session.webui_turns import (
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.prompt_templates import render_template
 from nanobot.webui.cli_apps_api import normalize_cli_app_mentions
+from nanobot.webui.file_preview import (
+    WebUIFilePreviewError,
+    file_preview_availability_payload,
+    file_preview_payload,
+    file_reference_payload,
+)
 from nanobot.webui.forking import handle_webui_fork_chat
 from nanobot.webui.gateway_services import GatewayServices
 from nanobot.webui.mcp_presets_api import normalize_mcp_preset_mentions
@@ -151,8 +157,11 @@ class WebUICommandRouter:
         self.request_operations: dict[str, WebUIRequestOperation] = {}
         self.request_locks: dict[ServerConnection, asyncio.Lock] = {}
 
-    def workspace_controls_available(self, connection: ServerConnection) -> bool:
-        return self._http_router.workspace_controls_available(connection)
+    def workspace_project_selection_available(self, connection: ServerConnection) -> bool:
+        return self._http_router.workspace_project_selection_available(connection)
+
+    def workspace_full_access_available(self, connection: ServerConnection) -> bool:
+        return self._http_router.workspace_full_access_available(connection)
 
     async def send_webui_protocol_error(
         self,
@@ -296,7 +305,8 @@ class WebUICommandRouter:
                 connection,
                 lambda: self._workspaces.scope_for_new_chat(
                     envelope,
-                    controls_available=self.workspace_controls_available(connection),
+                    can_change_project=self.workspace_project_selection_available(connection),
+                    can_use_full_access=self.workspace_full_access_available(connection),
                 ),
             )
             if scope is None:
@@ -436,7 +446,8 @@ class WebUICommandRouter:
                     envelope,
                     chat_id=chat_id,
                     chat_running=websocket_turn_wall_started_at(chat_id) is not None,
-                    controls_available=self.workspace_controls_available(connection),
+                    can_change_project=self.workspace_project_selection_available(connection),
+                    can_use_full_access=self.workspace_full_access_available(connection),
                 ),
                 chat_id=chat_id,
             )
@@ -580,7 +591,8 @@ class WebUICommandRouter:
                     envelope,
                     chat_id=chat_id,
                     chat_running=websocket_turn_wall_started_at(chat_id) is not None,
-                    controls_available=self.workspace_controls_available(connection),
+                    can_change_project=self.workspace_project_selection_available(connection),
+                    can_use_full_access=self.workspace_full_access_available(connection),
                 )
             ),
             chat_id=chat_id,
@@ -773,6 +785,46 @@ class WebUICommandRouter:
                 status=400,
                 message="WebUI mutation payload must be an object",
             )
+            return
+
+        if action == "temporary_chat.file_preview":
+            # Connection-owned, read-only, and deliberately outside the mutation
+            # replay cache: private paths/content must not outlive this request.
+            preview_payload = cast(dict[str, object], payload)
+            chat_id = preview_payload.get("chat_id")
+            path = preview_payload.get("path")
+            probe = preview_payload.get("probe") is True
+            metadata_only = preview_payload.get("metadata") is True
+            if not isinstance(chat_id, str) or not isinstance(path, str):
+                await self.send_webui_response(
+                    connection, request_id, status=400, message="invalid preview request",
+                )
+                return
+            try:
+                policy = self._temporary_chats.message_policy(connection, chat_id, "")
+                if policy is None:
+                    raise TemporaryChatError("temporary_chat_unavailable")
+                if metadata_only:
+                    result = file_reference_payload(path, scope=policy.workspace_scope)
+                elif probe:
+                    result = file_preview_availability_payload(path, scope=policy.workspace_scope)
+                else:
+                    result = file_preview_payload(path, scope=policy.workspace_scope)
+            except TemporaryChatError as exc:
+                await self.send_webui_response(
+                    connection, request_id, status=404, message=exc.detail,
+                )
+            except WebUIFilePreviewError as exc:
+                if probe and not metadata_only and exc.status in {400, 403, 404, 413, 415}:
+                    await self.send_webui_response(
+                        connection, request_id, result={"available": False},
+                    )
+                else:
+                    await self.send_webui_response(
+                        connection, request_id, status=exc.status, message=exc.message,
+                    )
+            else:
+                await self.send_webui_response(connection, request_id, result=result)
             return
 
         payload_digest = hashlib.sha256(

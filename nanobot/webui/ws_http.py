@@ -41,6 +41,7 @@ from nanobot.webui.file_preview import (
     WebUIFilePreviewError,
     file_preview_availability_payload,
     file_preview_payload,
+    file_reference_payload,
 )
 from nanobot.webui.gateway_tokens import GatewayTokenStore, token_response_payload
 from nanobot.webui.http_utils import JSONResponseMetrics
@@ -65,9 +66,6 @@ from nanobot.webui.http_utils import (
 )
 from nanobot.webui.http_utils import (
     is_local_browser_request as _is_local_browser_request,
-)
-from nanobot.webui.http_utils import (
-    is_localhost as _is_localhost,
 )
 from nanobot.webui.http_utils import is_loopback_host as _is_loopback_host
 from nanobot.webui.http_utils import (
@@ -129,6 +127,7 @@ from nanobot.webui.skills_marketplace import (
     search_marketplace_skills,
     trending_marketplace_skills,
 )
+from nanobot.webui.star_prompt import update_star_prompt
 from nanobot.webui.thread_disk import delete_webui_thread
 from nanobot.webui.transcript import (
     TranscriptReplayStats,
@@ -173,6 +172,8 @@ _WEBUI_MUTATION_PATHS = {
     "skill.install": "/api/webui/skills/install",
     "skill.update": "/api/webui/skills/update",
     "skill.delete": "/api/webui/skills/delete",
+    "star_prompt.claim": "/api/webui/star-prompt/claim",
+    "star_prompt.dismiss": "/api/webui/star-prompt/dismiss",
     "sidebar.update": "/api/webui/sidebar-state/update",
     "workspace.pick_folder": "/api/workspaces/pick-folder",
     "recovery.continue": "/api/webui/recovery/continue",
@@ -407,8 +408,34 @@ class GatewayHTTPHandler:
             mcp_oauth_redirect_uri=self._mcp_oauth_redirect_uri,
         )
 
-    def workspace_controls_available(self, connection: Any) -> bool:
-        return self._runtime_surface == "native" or _is_localhost(connection)
+    def workspace_project_selection_available(self, connection: Any) -> bool:
+        """Return whether an authenticated WebUI may submit a server path.
+
+        Project paths are interpreted by the gateway, not by the browser. The
+        WebUI route and WebSocket handshake already authenticate the caller,
+        so remote clients can use the manual server-path picker as well.
+        """
+        return True
+
+    def workspace_full_access_available(
+        self,
+        connection: Any,
+        headers: Any | None = None,
+    ) -> bool:
+        """Return whether this request may opt into Full Access.
+
+        A reverse proxy can make a remote browser look like a localhost TCP
+        peer. Inspect the original browser headers before granting this
+        capability so proxy-local requests keep the remote restriction.
+        """
+        if self._runtime_surface == "native":
+            return True
+        if headers is None:
+            request = getattr(connection, "request", None)
+            headers = getattr(request, "headers", None)
+        if not isinstance(headers, Mapping):
+            return False
+        return _is_local_browser_request(connection, headers)
 
     def workspace_folder_picker_available(
         self,
@@ -497,6 +524,8 @@ class GatewayHTTPHandler:
             "/api/webui/skills/install",
             "/api/webui/skills/update",
             "/api/webui/skills/delete",
+            "/api/webui/star-prompt/claim",
+            "/api/webui/star-prompt/dismiss",
             "/api/webui/sidebar-state/update",
             "/api/workspaces/pick-folder",
         }
@@ -1094,17 +1123,20 @@ class GatewayHTTPHandler:
         query = _parse_query(request.path)
         path = _query_first(query, "path")
         is_probe = _query_first(query, "probe") == "1"
+        metadata_only = _query_first(query, "metadata") == "1"
         try:
             scope = self.workspaces.scope_for_session_key(decoded_key)
-            if is_probe:
+            if metadata_only:
+                payload = file_reference_payload(path, scope=scope)
+            elif is_probe:
                 payload = file_preview_availability_payload(path, scope=scope)
             else:
                 payload = file_preview_payload(path, scope=scope)
         except WebUIFilePreviewError as e:
-            if is_probe and e.status in {400, 403, 404, 415}:
-                return _http_json_response({"available": False})
+            if is_probe and not metadata_only and e.status in {400, 403, 404, 413, 415}:
+                return _http_json_response({"available": False}, extra_headers=_NO_STORE_HEADERS)
             return _http_error(e.status, e.message)
-        return _http_json_response(payload)
+        return _http_json_response(payload, extra_headers=_NO_STORE_HEADERS)
 
     def _handle_session_automations(self, request: WsRequest, key: str) -> Response:
         if not self.check_api_token(request):
@@ -1423,6 +1455,15 @@ class GatewayHTTPHandler:
         m = re.match(r"^/api/webui/skills/([^/]+)$", got)
         if m:
             return self._handle_webui_skill_detail(request, m.group(1))
+        if got in {"/api/webui/star-prompt/claim", "/api/webui/star-prompt/dismiss"}:
+            if not self.check_api_token(request):
+                return _http_error(401, "Unauthorized")
+            try:
+                show = update_star_prompt("claim" if got.endswith("/claim") else "dismiss")
+            except (OSError, ValueError, TimeoutError):
+                self._log.exception("failed to persist star invitation state")
+                return _http_error(500, "failed to save reminder preference")
+            return _http_json_response({"show": show})
         if got == "/api/webui/sidebar-state":
             return self._handle_webui_sidebar_state(request)
         if got == "/api/webui/sidebar-state/update":
@@ -1439,7 +1480,11 @@ class GatewayHTTPHandler:
             return _http_error(401, "Unauthorized")
         return _http_json_response(
             self.workspaces.payload(
-                controls_available=self.workspace_controls_available(connection),
+                can_change_project=self.workspace_project_selection_available(connection),
+                can_use_full_access=self.workspace_full_access_available(
+                    connection,
+                    request.headers,
+                ),
                 folder_picker_available=self.workspace_folder_picker_available(
                     connection,
                     request,

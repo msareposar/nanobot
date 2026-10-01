@@ -12,9 +12,11 @@ import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { Streamdown, type Components, type StreamdownProps } from "streamdown";
+import remend from "remend";
 
 import { AttachmentTile } from "@/components/AttachmentTile";
 import { CodeBlock } from "@/components/CodeBlock";
+import { WebLink } from "@/components/WebLink";
 import {
   INLINE_TOKEN_HIGHLIGHT_COLOR,
   InlineTokenHighlight,
@@ -41,6 +43,7 @@ interface MarkdownTextRendererProps {
   className?: string;
   highlightCode?: boolean;
   streaming?: boolean;
+  preserveStreamingLayout?: boolean;
   onOpenFilePreview?: (path: string) => void;
 }
 
@@ -451,7 +454,7 @@ function InlineLinkPreviewRow({ link }: { link: InlineLinkPreview }) {
     : link.title;
 
   return (
-    <a
+    <WebLink
       href={link.href}
       target="_blank"
       rel="noreferrer noopener"
@@ -487,7 +490,7 @@ function InlineLinkPreviewRow({ link }: { link: InlineLinkPreview }) {
       <span className="min-w-0 [overflow-wrap:anywhere] leading-normal sm:truncate">
         {label}
       </span>
-    </a>
+    </WebLink>
   );
 }
 
@@ -529,6 +532,7 @@ export default function MarkdownTextRenderer({
   className,
   highlightCode = true,
   streaming = false,
+  preserveStreamingLayout = false,
   onOpenFilePreview,
 }: MarkdownTextRendererProps) {
   const { t } = useTranslation();
@@ -672,7 +676,7 @@ export default function MarkdownTextRenderer({
           return <>{markdownChildren}</>;
         }
         return (
-          <a
+          <WebLink
             href={href}
             target="_blank"
             rel="noreferrer noopener"
@@ -680,7 +684,7 @@ export default function MarkdownTextRenderer({
             {...props}
           >
             {markdownChildren}
-          </a>
+          </WebLink>
         );
       },
       // Streamdown decorates emphasis with spans by default. Preserve native
@@ -714,11 +718,13 @@ export default function MarkdownTextRenderer({
           >
             <table
               className={cn(
-                "w-full min-w-max border-collapse text-[13px] leading-5",
+                "w-full table-fixed border-collapse text-[13px] leading-5",
                 "[&_thead]:bg-muted/45 [&_thead]:text-muted-foreground",
                 "[&_th]:border-b [&_th]:border-border/65 [&_th]:px-3 [&_th]:py-2",
-                "[&_th]:text-left [&_th]:font-medium",
+                "[&_th]:text-left [&_th]:font-medium [&_th]:whitespace-normal",
+                "[&_th]:[overflow-wrap:anywhere]",
                 "[&_td]:border-b [&_td]:border-border/55 [&_td]:px-3 [&_td]:py-2",
+                "[&_td]:whitespace-normal [&_td]:[overflow-wrap:anywhere]",
                 "[&_th:not(:last-child)]:border-r [&_th:not(:last-child)]:border-border/45",
                 "[&_td:not(:last-child)]:border-r [&_td:not(:last-child)]:border-border/45",
                 "[&_tbody_tr:last-child_td]:border-b-0",
@@ -823,9 +829,8 @@ export default function MarkdownTextRenderer({
   return (
     <Streamdown
       key={needsMath && mathPlugin ? "math" : "text"}
-      mode={streaming ? "streaming" : "static"}
-      parseIncompleteMarkdown
-      remend={REMEND_OPTIONS}
+      mode={streaming || preserveStreamingLayout ? "streaming" : "static"}
+      parseIncompleteMarkdown={false}
       isAnimating={false}
       animated={false}
       linkSafety={DIRECT_LINKS}
@@ -848,7 +853,8 @@ export default function MarkdownTextRenderer({
         className,
       )}
     >
-      {children}
+      {/* Streamdown 2.5 ignores repair-option changes in its memo comparator. */}
+      {streaming ? remend(children, REMEND_OPTIONS) : children}
     </Streamdown>
   );
 }

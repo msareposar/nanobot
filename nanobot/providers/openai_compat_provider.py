@@ -117,6 +117,7 @@ _KIMI_SERVER_MANAGED_TEMPERATURE_MODELS: frozenset[str] = frozenset({
     "kimi-k2.6",
 })
 _DEEPSEEK_MULTIMODAL_MODELS: frozenset[str] = frozenset({
+    "deepseek-flash",
     "deepseek-v4-flash-vision-exp",
 })
 _TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
@@ -785,10 +786,6 @@ class OpenAICompatProvider(LLMProvider):
                         tc_clean["function"] = function_clean
                     normalized.append(tc_clean)
                 clean["tool_calls"] = normalized
-                if clean.get("role") == "assistant":
-                    # Some OpenAI-compatible gateways reject assistant messages
-                    # that mix non-empty content with tool_calls.
-                    clean["content"] = None
             if "tool_call_id" in clean and clean["tool_call_id"]:
                 clean["tool_call_id"] = map_tool_result_id(clean["tool_call_id"])
             if (
@@ -1076,7 +1073,7 @@ class OpenAICompatProvider(LLMProvider):
 
         # Backfill reasoning_content="" on assistants missing it: DeepSeek
         # thinking mode rejects history otherwise (#3554, #3584); "" reads
-        # as "no thinking that turn". DeepSeek-V4/reasoner reason natively,
+        # as "no thinking that turn". DeepSeek Flash/V4/reasoner reason natively,
         # so backfill even without explicit reasoning_effort.
         explicit_thinking = (
             reasoning_effort is not None
@@ -1090,7 +1087,10 @@ class OpenAICompatProvider(LLMProvider):
             spec is not None
             and spec.name == "deepseek"
             and semantic_effort not in ("none", "minimal", "minimum")
-            and any(t in model_name.lower() for t in ("deepseek-v4", "deepseek-reasoner"))
+            and (
+                slug == "deepseek-flash"
+                or any(t in model_name.lower() for t in ("deepseek-v4", "deepseek-reasoner"))
+            )
         )
         if explicit_thinking or implicit_deepseek_thinking:
             for msg in kwargs["messages"]:
@@ -2060,19 +2060,20 @@ class OpenAICompatProvider(LLMProvider):
                                 break
 
                     capture = ResponsesStreamCapture()
-                    (
-                        content,
-                        tool_calls,
-                        finish_reason,
-                        usage,
-                        reasoning_content,
-                    ) = await consume_sdk_stream(
-                        _timed_stream(),
-                        on_content_delta,
-                        on_tool_call_delta=on_tool_call_delta,
-                        on_reasoning_delta=on_thinking_delta,
-                        capture=capture,
-                    )
+                    async with responses_stream:
+                        (
+                            content,
+                            tool_calls,
+                            finish_reason,
+                            usage,
+                            reasoning_content,
+                        ) = await consume_sdk_stream(
+                            _timed_stream(),
+                            on_content_delta,
+                            on_tool_call_delta=on_tool_call_delta,
+                            on_reasoning_delta=on_thinking_delta,
+                            capture=capture,
+                        )
                     self._record_responses_success(model, reasoning_effort)
                     result = LLMResponse(
                         content=content or None,
