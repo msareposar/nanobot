@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from nanobot.config.schema import ProviderConfig, ToolsConfig
     from nanobot.cron.service import CronService
     from nanobot.providers.factory import ProviderSnapshot
-    from nanobot.security.workspace_access import WorkspaceSandboxStatus
+    from nanobot.security.workspace_access import WorkspaceSandboxStatus, WorkspaceScope
     from nanobot.session.manager import SessionManager
     from nanobot.utils.llm_runtime import LLMRuntime
 
@@ -41,6 +41,11 @@ class RequestContext:
     workspace: Path | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
     log_content: bool = True
+    # The host can consume completion messages after this request returns.
+    can_receive_background_results: bool = True
+    persist_session: bool = True
+    # Effective tool scope; injected inputs retain the active run's scope.
+    workspace_scope: WorkspaceScope | None = None
 
 
 @runtime_checkable

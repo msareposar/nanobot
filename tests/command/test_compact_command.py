@@ -15,13 +15,14 @@ from nanobot.bus.runtime_events import TurnCompleted
 from nanobot.command.builtin import cmd_stop
 from nanobot.command.router import CommandContext
 from nanobot.providers.base import GenerationSettings, LLMResponse, ProviderConversationState
+from nanobot.runtime_context import public_history_message
 from nanobot.session.history_visibility import is_hidden_history_message
 
 
 @pytest.fixture
 async def loop(tmp_path):
     bus = MessageBus()
-    provider = MagicMock()
+    provider = MagicMock(aclose=AsyncMock())
     provider.get_default_model.return_value = "test-model"
     provider.generation = GenerationSettings(max_tokens=100)
     provider.can_resume_conversation_state.return_value = True
@@ -139,11 +140,12 @@ async def test_compacted_session_waits_for_new_input_without_continuation(
         "content": loop.context.build_system_prompt(channel="cli", session_summary=expected_summary),
     }
     assert [message["role"] for message in sent] == ["system", "user"]
-    assert sent[1]["content"] == "hi"
+    assert sent[1]["content"].startswith("hi\n\n")
+    assert "File access: no workspace restriction." in sent[1]["content"]
 
     loop.sessions.invalidate(key)
     resumed = loop.sessions.get_or_create(key)
-    assert resumed.get_history() == [
+    assert resumed.get_history(include_runtime_context=False) == [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "Hello!"},
     ]
@@ -278,7 +280,7 @@ async def test_compact_is_a_fifo_barrier_during_an_active_turn(loop) -> None:
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    assert [message["content"] for message in compacted_history if message["role"] == "user"] == [
+    assert [public_history_message(message)["content"] for message in compacted_history if message["role"] == "user"] == [
         "initial question", "before compaction",
     ]
     assert all("/compact" != message.get("content") for request in requests for message in request)

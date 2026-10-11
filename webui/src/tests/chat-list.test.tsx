@@ -95,7 +95,7 @@ describe("ChatList", () => {
       .toContain(sessionHandleColor("handle_1234"));
 
     expect(conversation.closest("[data-chat-row]"))
-      .toHaveClass("rounded-xl");
+      .toHaveClass("rounded-control");
     expect(conversation.querySelector("[data-sidebar-selection-track]")).toBeNull();
   });
 
@@ -372,12 +372,12 @@ describe("ChatList", () => {
     expect(screen.queryByRole("menuitem", { name: "Target pane" }))
       .not.toBeInTheDocument();
     const fullTarget = await screen.findByRole("menuitem", {
-      name: "Existing group · 4/4",
+      name: "Existing group 4/4",
     });
     expect(fullTarget).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(fullTarget);
     expect(onAttachPane).not.toHaveBeenCalled();
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Fine group · 1/4" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Fine group 1/4" }));
     expect(onAttachPane).toHaveBeenCalledWith("websocket:solo", "tab:fine");
   });
 
@@ -635,7 +635,7 @@ describe("ChatList", () => {
     }), { button: 0, ctrlKey: false });
     const moveTo = await screen.findByRole("menuitem", { name: "Move to" });
     fireEvent.pointerMove(moveTo, { pointerType: "mouse" });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Target tab · 2/4" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Target tab 2/4" }));
     expect(onAttachPane).toHaveBeenCalledWith("websocket:child", "websocket:target");
 
     fireEvent.pointerDown(screen.getByRole("button", {
@@ -706,7 +706,7 @@ describe("ChatList", () => {
     expect(tabSurface).toContainElement(paneList);
     const activePane = within(tabGroup).getByRole("button", { name: "Research pane" });
     expect(activePane).toHaveAttribute("aria-current", "true");
-    expect(activePane.closest("[data-sidebar-pane]")).toHaveClass("rounded-xl");
+    expect(activePane.closest("[data-sidebar-pane]")).toHaveClass("rounded-control");
     expect(screen.getByTestId("chats-selection-highlight"))
       .toHaveAttribute("data-active-id", "websocket:root");
     expect(screen.getByRole("button", {
