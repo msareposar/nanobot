@@ -16,7 +16,7 @@ Use the launcher:
 nanobot webui
 ```
 
-`nanobot webui` creates the config/workspace when needed, enables the local WebSocket channel after confirmation, generates a WebUI bootstrap secret when one is missing, starts or joins the same on-demand gateway used by the native TUI, and opens the browser. With a fresh config, it can open before a model is configured so you can finish setup in **Settings → Models**. The first-run path binds the WebUI to `127.0.0.1` by default, so it is not available from other devices on your LAN. While the launcher remains attached, it mirrors new log output from that exact gateway instance in the terminal without replaying older logs.
+`nanobot webui` asks for one confirmation on a new installation, creates the config/workspace, enables the local WebSocket channel, and generates a WebUI bootstrap secret when one is missing. It starts or joins the same on-demand gateway used by the native TUI and opens the browser. With a fresh config, it can open before a model is configured so you can finish setup in **Settings → Models**. The first-run path binds the WebUI to `127.0.0.1` by default, so it is not available from other devices on your LAN. The startup summary groups the login link, model setup guidance, config, and exit controls with blank lines. While attached, the launcher displays new gateway warnings and errors; use the printed logs command for full output.
 
 After model setup, explicitly promote the shared gateway when you do not want to keep a client open:
 
@@ -28,7 +28,16 @@ nanobot gateway --background
 
 Each foreground WebUI or TUI launcher releases only its own client. The last interactive launcher stops an on-demand gateway. `nanobot gateway --background` makes the gateway persistent; manage it with `nanobot gateway status`, `nanobot gateway logs`, `nanobot gateway restart`, and `nanobot gateway stop`.
 
-Manual config still works. Same-machine localhost WebUI access can run without a browser password. Set `tokenIssueSecret` when you intentionally expose the WebUI beyond localhost or want a browser password:
+The browser signs in automatically using the generated credential in the launch URL. The terminal also prints the complete login link: if automatic opening fails, copy that link into your browser, including the fragment after `#`. In WSL, the launcher opens your Windows default browser through Windows PowerShell; an explicit `BROWSER` setting takes precedence. If Windows integration is unavailable, open the printed link in your Windows browser. The plain page address does not sign in a new browser. Treat the login link as a credential and do not share it.
+
+`nanobot webui --no-open` prints the same login link without opening a browser. Development mode uses the Vite address, normally `http://127.0.0.1:5173`, with the same gateway authentication.
+
+If no provider is configured, follow the **Next step** prompt to open **Settings → Models**. Errors for a configured provider appear with that prompt.
+
+<details>
+<summary>Manual configuration for the local WebUI</summary>
+
+Manual config still works. Same-machine localhost WebUI access can run without a browser password. Set `tokenIssueSecret` when you intentionally expose the WebUI beyond localhost or want a browser password. These listener and authentication fields have no graphical editor:
 
 ```json
 {
@@ -43,7 +52,21 @@ Manual config still works. Same-machine localhost WebUI access can run without a
 }
 ```
 
+</details>
+
 The WebUI is served by the WebSocket channel on port `8765` by default. The gateway health endpoint, `18790` by default, is not the browser UI.
+
+## Navigate a long conversation
+
+On wide conversation panes, the left message rail lists all saved prompts independently of the loaded message page. Scroll the rail to browse, hover to preview, and click to jump directly to a prompt; its edges fade without extending the conversation layout. The header's message navigation also supports searching the prompt summaries. Both lists render a visible window rather than thousands of controls. Older compatible hosts without `webui.prompt-navigation.v1` retain navigation within already-loaded messages.
+
+Jumping reads a bounded page near the selected prompt, not every earlier answer. Browsing keeps at most three server pages, supports scrolling backward and forward, and the bottom arrow returns to the live conversation. A failed read leaves the current content intact and offers retry. The navigation index is a rebuildable, bounded summary cache over the WebUI display transcript; it does not change the SQLite session schema, agent context, configuration, or chat data. On first access to a long uncached conversation, building the summaries requires reading its transcript segments in a worker thread; later accesses reuse unchanged segment summaries. Unchanged directories use conditional requests without a response body. Changed directories transfer only the changed suffix when a previous snapshot is still cached; after a restart or cache eviction, the host sends a complete directory. These caches are held in memory and do not create another persistent chat store.
+
+## Sharing access
+
+The WebUI is an administration interface for one nanobot instance. Signed-in WebUI users can work with its saved topics and manage models, channels, Apps, automations, and settings within the gateway's supported capabilities. There are no per-user roles or private topic ownership boundaries. Remote package installation has an additional restriction described under [LAN Access](#lan-access); that restriction does not turn other WebUI users into read-only users.
+
+Share WebUI access only with people you trust to administer the same agent. To give someone chat access without the administration interface, connect a [chat platform](./chat-apps.md) and configure its access policy. Channel approval still does not create a separate agent or memory store. For separate clients or users whose data must not mix, use [separate instances](./multiple-instances.md).
 
 ## First 10 Minutes
 
@@ -52,7 +75,7 @@ Use the WebUI as the primary setup surface:
 1. Open **Settings → Models** and configure a provider, credential, and active model preset.
 2. Send `Hello!` in a new topic to prove the selected model works.
 3. Start a separate topic before project work, then choose the intended workspace and access mode.
-4. Add only one capability next: a chat channel in **Settings → Channels**, a web/voice/image provider in **Settings**, or an App/MCP integration in **Apps**.
+4. Add only one capability next: a chat channel in **Channels**, a web/voice/image provider in **Settings**, or an App/MCP integration in **Apps**.
 5. Restart when the WebUI shows a restart requirement, then test that capability with the smallest possible request.
 
 This path avoids hand-editing `config.json` for normal setup. Use the reference docs when you need an option the WebUI does not expose or when you manage config as code.
@@ -82,7 +105,7 @@ Returning users may see an illustrated invitation to star nanobot on GitHub. It 
 
 The sidebar is the topic switcher. Each topic keeps its own history, title, workspace selection, and linked automations. Use a new topic when you want a separate context; use fork when you want to continue from an existing point without changing the original thread.
 
-On touch devices, sidebar action buttons stay visible with larger touch areas for topics, conversation groups, panes, and projects. Tap a title to select it or the adjacent action button for its menu. Desktop actions still appear on hover or keyboard focus. Press Escape in an action menu to return focus to its button and continue with Tab, including from the **Move to** submenu. ArrowLeft leaves the submenu and returns to **Move to** without closing the parent menu. Choosing Rename instead moves focus into the dialog; clicking outside a menu keeps focus at the clicked destination.
+On touch devices, sidebar action buttons stay visible with larger touch areas for topics, conversation groups, panes, and projects. Tap a title to select it or the adjacent action button for its menu. Desktop actions still appear on hover or keyboard focus. Press Escape in an action menu to return focus to its button and continue with Tab, including from the **Move to** submenu. ArrowLeft leaves the submenu and returns to **Move to** without closing the parent menu. Choosing **Rename** for a topic moves focus into its sidebar title. Edit the name in place, then press Enter or choose the checkmark to save; press Escape or choose × to cancel. A failed save keeps the draft and an error beside it so you can retry. Project and conversation-group names still use dialogs. Clicking outside a menu keeps focus at the clicked destination.
 
 Drag a topic within its current sidebar group to keep frequently used work in your preferred order. Drag a topic from the sidebar into the composer when you want to reference it in the next message instead of switching to it.
 
@@ -98,11 +121,15 @@ To bring another topic's work into a conversation, select it from the `@` menu o
 
 The message timeline shows replies and agent activity. Expand the **Worked for** section to inspect the reasoning and tool activity for a completed turn.
 
+If the connection drops, the host control shows **Reconnecting**. Tasks in persistent topics can continue during the interruption. After reconnecting, task indicators and completed replies update automatically, including topics you have switched away from. Some text generated while disconnected may appear only after the task finishes. [Temporary chats](#temporary-chats) end when their connection is lost.
+
 When the agent writes or edits files, the activity item shows the target path, status, and changed line counts. Choose **Settings → Appearance → File edit display** to control the detail: **Summary** shows the change summary, **Diff** shows available unified patches inline, and **Collapsed diff** lets you expand them with **View diff**. Large diffs may hide unchanged lines or truncate the inline preview. Select the filename in the activity row to open the read-only file preview panel.
 
 Files open as tabs in one preview pane. Select another file to add or switch a tab without reopening the pane; close a tab with its **×**, or close the pane with **Escape**. Tabs and width follow each session while the WebUI remains open. They are kept only in memory and cleared when that session is deleted or the connection ends. The pane overlays the conversation on narrow screens.
 
-Text previews include up to 384 KiB, with a notice when the file is truncated. Large previews show readable text before adding syntax colors; very large or minified source stays plain text. All previewed text remains available for selection and browser search, and the code pane scrolls in both directions.
+Markdown files open in **Preview**, with formatted headings, lists, tables and code blocks. Select **Source** to see the original Markdown with line numbers, then **Preview** to return. The control changes only the display; it does not edit or read the file again. Each newly opened or selected file starts in Preview. Images in Markdown appear as links and do not load automatically. Local links open through the same file access checks; relative paths start from the document's folder. Section-only links remain text. HTML and MDX components do not execute.
+
+Text previews include up to 384 KiB, with a notice when the file is truncated. Large source previews show readable text before adding syntax colors; very large or minified source stays plain text. All previewed text remains available for selection and browser search, and the source pane scrolls in both directions.
 
 PNG, JPEG, GIF and WebP files up to 8 MiB can be previewed as images. Hover or focus an image file reference for a compact quick look, or select it to open the pane. Select the preview image for the full-size viewer, which supports zoom controls, pinch-to-zoom and panning. HTML and SVG files remain read-only source previews rather than executable pages.
 
@@ -164,13 +191,13 @@ Selecting a project does not replace the configured agent workspace. The two pat
 | Relative file paths and shell working directory | Long-term memory and history |
 | The normal read/write boundary in Restricted mode | Custom skills and instance state |
 
+A new topic separates conversation history; a project selection changes the file working directory. Neither creates a separate long-term memory store. Project switching can therefore carry preferences and facts learned in other topics into the new project. Use [separate instances](./multiple-instances.md) when client or user data must stay separate; see [Memory](./memory.md) for how shared memory is maintained.
+
 Project-local `SOUL.md` and `USER.md` files are ignored, and the agent workspace's `AGENTS.md` is not inherited by a separately selected project. When the selected project is the configured agent workspace, both roles naturally use the same directory.
 
 The access control in the composer controls the local capability level for the chat. It does not bypass your gateway, provider, shell sandbox, or operating system configuration; it only selects among the capabilities that are already available to the current topic.
 
 In Restricted mode, ordinary file and shell work stays inside the selected project. To preserve agent continuity, filesystem/search tools receive narrow, read-only access to built-in skills, custom skills in the agent workspace, and the exact agent `memory/history.jsonl` file. This does not grant access to neighboring memory or profile files, and it does not allow writes outside the selected project. These tool exceptions do not broaden the browser's file preview boundary.
-
-Remote WebUI connections may reduce access for the current workspace and may select a different workspace by browsing folders or entering its server-side path. A remote project change must use Restricted mode; enabling Full Access remains limited to local and native clients.
 
 ## Composer
 
@@ -188,7 +215,7 @@ For image generation, configure an image provider first and then use the WebUI i
 
 ## Channels
 
-Open **Settings → Channels** to connect chat apps without assembling JSON by hand. Search for a platform, open its setup panel, and follow the fields or QR flow shown for that channel. The guided setup can:
+Open **Channels** to connect chat apps without assembling JSON by hand. Search for a platform, open its setup panel, and follow the fields or QR flow shown for that channel. The guided setup can:
 
 - install missing optional channel support when the WebUI is running locally;
 - collect platform credentials while preserving previously saved values;
@@ -287,6 +314,9 @@ Plain HTTP is enough for basic WebUI access, but browsers expose microphone capt
 
 Remote WebUI clients with a valid token can view and use Apps and installed skills. Actions that install missing nanobot support packages or third-party marketplace skills are blocked by default. To let trusted remote administrators perform those installations through the WebUI, opt in explicitly:
 
+<details>
+<summary>Manual configuration</summary>
+
 ```json
 {
   "tools": {
@@ -294,6 +324,8 @@ Remote WebUI clients with a valid token can view and use Apps and installed skil
   }
 }
 ```
+
+</details>
 
 Use this only for a private deployment where every authenticated WebUI user is trusted to change nanobot's Python environment and install workspace skill instructions or scripts. If you publish the WebUI through Nginx, Caddy, Cloudflare Tunnel, or a similar service, treat it as remote access and leave package and skill installs disabled unless that is intentional.
 

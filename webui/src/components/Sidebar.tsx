@@ -49,7 +49,7 @@ interface SidebarProps {
   onRequestDelete: (key: string, label: string) => void;
   onRequestDeleteMany?: (items: SidebarDeleteItem[]) => void;
   onTogglePin: (key: string) => void;
-  onRequestRename: (key: string, label: string) => void;
+  onRequestRename: (key: string, title: string) => Promise<void>;
   onRequestRenameTab?: (key: string, label: string) => void;
   onToggleArchive: (key: string) => void;
   paneGroups?: Record<string, SidebarPaneGroup>;
@@ -302,8 +302,6 @@ export function Sidebar(props: SidebarProps) {
             updatedChatIds={props.updatedChatIds}
             recoveryChatIds={props.recoveryChatIds}
             density={props.viewState?.density}
-            showPreviews={props.viewState?.show_previews}
-            showTimestamps={props.viewState?.show_timestamps}
             sort={props.viewState?.sort}
             showArchived={props.showArchived}
             defaultWorkspacePath={props.defaultWorkspacePath}
