@@ -11,6 +11,11 @@ RUN mkdir -p /app/nanobot/web && npm run build
 
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
+# Pinned version of the official Google Workspace CLI (googleworkspace/cli).
+# Installed from the musl static build so the binary runs regardless of the base
+# image's glibc version (the gnu build needs GLIBC >= 2.39).
+ARG GWS_VERSION=0.22.5
+
 # Install system dependencies + CLI tools
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg git bubblewrap openssh-client libmagic1 && \
@@ -19,7 +24,10 @@ RUN apt-get update && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends gh && \
-    curl -fsSL https://github.com/openclaw/gogcli/releases/download/v0.19.0/gogcli_0.19.0_linux_amd64.tar.gz | tar -xz -C /usr/local/bin gog && \
+    GWS_ARCH=$(case "$(dpkg --print-architecture)" in amd64) echo x86_64 ;; arm64) echo aarch64 ;; *) echo x86_64 ;; esac) && \
+    curl -fsSL "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/google-workspace-cli-${GWS_ARCH}-unknown-linux-musl.tar.gz" | tar -xz -C /usr/local/bin ./gws && \
+    chmod 0755 /usr/local/bin/gws && \
+    gws --version && \
     curl -fsSL https://github.com/larksuite/cli/releases/download/v1.0.42/lark-cli-1.0.42-linux-amd64.tar.gz | tar -xz -C /usr/local/bin lark-cli && \
     apt-get purge -y gnupg && \
     apt-get autoremove -y && \
