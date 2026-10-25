@@ -521,8 +521,22 @@ jobs:
               assert "no-new-privileges:true" in service["security_opt"]
           PY
 
-      - name: Verify default WhatsApp dependencies
-        run: docker run --rm --entrypoint python nanobot:test -c "import neonize, segno"
+      - name: Verify default channel dependencies
+        run: |
+          docker run --rm --entrypoint python nanobot:test -c '
+          from nanobot.channels.registry import discover_plugins
+          from nanobot.optional_features import extra_installed
+
+          plugins = discover_plugins()
+          defaults = {"discord", "weixin", "qq", "feishu"}
+          missing = {
+              name: list(plugins[name].dependencies)
+              for name in sorted(defaults)
+              if not extra_installed(name, list(plugins[name].dependencies))
+          }
+          assert not missing, missing
+          print("default channel dependencies preinstalled:", ", ".join(sorted(defaults)))
+          '
 
       - name: Verify runtime dependency permissions
         run: >-
